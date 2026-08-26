@@ -1,0 +1,120 @@
+# =========================================================================
+# Diff-Wheelbot：X-NavDP cluttered_easy 高密度走廊训练配置
+#
+# 10x10 地图 + 分层（stratified）障碍布局，面向窄通道通行能力。
+# 刻意不包含 --resume，每次启动都是全新训练。
+# 注意：障碍数量已从 20/12/8 降为 14/8/6（原密度几乎堵死通道）；
+#       如需严格对齐 X-NavDP clutter 基准分布，请恢复原数量与半径。
+#
+# 用法：python3 train_mpc.py @configs/xnavdp_dense_corridor_v2.args
+# 命令行中出现在 @file 之后的参数会覆盖本文件中的取值。
+# =========================================================================
+
+# ---------------- 基础训练设置 ----------------
+--batch_size 256            
+--num_iters 30000          
+--lr 0.0001                
+--timesteps 120            
+--grad_decay 0.4            
+--fov_x_half_tan 0.82       
+--control_hz 15.0           
+--dt_noise_std 0.005        
+--motor_rate_min 3.0        
+--motor_rate_max 8.0        
+--max_action_delay_steps 1 
+--exec_v_scale_std 0.0      
+--exec_w_scale_std 0.0      
+--wheel_bias_std 0.0        
+--seed 1                   
+
+# ---------------- checkpoint / 日志 ----------------
+--save_dir save/xnavdp_dense_corridor_v2  
+--log_dir runs/xnavdp_dense_corridor_v2    
+--ckpt_interval 2500        
+--log_interval 25           
+--plot_interval 500         
+
+# ---------------- loss 权重 ----------------
+--coef_pos 1.0              
+--coef_v 0.25              
+--coef_heading 0.4         
+--coef_obj_avoidance 0.5 
+--coef_collide 3.0         
+--coef_smooth 0.05          
+--coef_bias 0.4      
+--coef_energy 0.00          
+--avoid_safe_distance 0.40  
+--approach_speed_gain 1.0   
+--approach_speed_max 2.0    
+--collision_soft_clearance 0.25 
+
+# 逐步、感知间隙自适应的期望速度：间隙从 0.24 m 圆形 Dingo 代理的
+# 机体表面起算，间隙越窄期望速度越低。
+--speed_distance_gain 0.30  # 距目标距离→期望速度增益
+--speed_min_scale 0.30      # 间隙最窄时期望速度保留比例
+--speed_clearance_min 0.05  # 开始降速的机体间隙 (m)
+--speed_clearance_full 0.55 # 恢复满速期望的机体间隙 (m)
+
+# ---------------- 策略网络 (model_mpc.Model) ----------------
+--num_waypoints 3           # 输出的局部航路点数量
+--hidden_dim 192            
+--max_forward_step 1.5      # 航路点前向步长上限（米）
+--max_lateral_step 1.0      # 航路点横向步长上限（米）
+--max_speed 2.0             
+--max_omega 3.0             
+--initial_desired_speed 1.5 # 期望速度头初始偏置
+--min_desired_speed 0.15    # 防止循环隐状态漂移时速度头塌缩到 0
+
+# ---------------- MPC (mpc.DifferentiableWaypointMPC) ----------------
+--mpc_horizon 12            # MPC 轨迹时域步数
+--mpc_control_lookahead 3   # 纯跟踪控制前瞻步
+--mpc_max_acc_v 8.0         # 线加速度上限
+--mpc_max_acc_omega 10.0    # 角加速度上限
+--mpc_max_lateral_acc 7.0   # 侧向加速度上限
+--mpc_track_weight 8.0      # 航路点跟踪权重
+--mpc_smooth_weight 30.0    # 轨迹平滑权重
+--mpc_initial_velocity_weight 4.0  # 初始速度一致性权重
+--mpc_obstacle_clearance 0.38      # 感知避障安全间距（米）【仅 mpc_perception_safety=true 时生效】
+--mpc_obstacle_temperature 0.15    # 避障软化温度【仅 mpc_perception_safety=true 时生效】
+--mpc_obstacle_refine_steps 2      # 避障轨迹修正迭代步数【仅 mpc_perception_safety=true 时生效】
+--mpc_perception_safety false      # 是否启用深度感知避障修正（false 时上方感知避障参数不参与计算）
+
+# ---------------- 感知处理（仅 mpc_perception_safety=true 时生效） ----------------
+--obstacle_num_points 16    # 深度图提取的障碍物扇区点数
+--obstacle_height_fraction 0.4  # 深度图有效高度比例
+--obstacle_depth_quantile 0.1   # 每扇区深度分位数
+--obstacle_min_range 0.2        # 最近感知距离
+--obstacle_max_range 6.0        # 最远感知距离
+--emergency_distance 1.2        # 紧急模式触发距离
+--emergency_ttc 0.7             # 紧急模式触发碰撞时间
+
+# ---------------- 环境设置 ----------------
+--map_size 12.0            
+--num_cyl 16                
+--num_balls 10               
+--num_vox 8                 
+--robot_radius 0.24         
+--cyl_radius_min 0.20       
+--cyl_radius_max 0.45       
+--ball_radius_min 0.20      
+--ball_radius_max 0.45      
+--ball_radius_floor 0.25    
+--env_width 64             
+--env_height 48         
+--diff_nearest_pt true      # 是否用 CUDA 解析梯度求最近障碍物点（train_mpc 实际未使用）
+--randomize_start_goal true # 每个 rollout 在四个角中随机选择起点，终点取对角点
+--protected_zone_radius 1.5 # 起点/终点周围禁止障碍物表面进入的半径 (m)
+
+# ---------------- 障碍布局 ----------------
+# 分层（stratified）快速采样：候选来自抖动网格单元，覆盖比独立均匀采样
+# 更均匀，但允许障碍重叠；obstacle_min_surface_gap 在此布局下不生效。
+--obstacle_layout stratified
+--obstacle_grid_jitter 0.35         # 网格单元内抖动幅度 (0~1)
+--obstacle_candidate_multiplier 2.0 # 候选网格密度倍数（>=1）
+
+# ---------------- 动态障碍训练 ----------------
+# 对齐静态 X-NavDP clutter 基准：全部置零，训练不采样也不推进动态障碍。
+--dynamic_obstacle_scene_prob 0.0  
+--dynamic_obstacle_ratio 0.0       
+--dynamic_obstacle_speed_min 0.0   
+--dynamic_obstacle_speed_max 0.0   
