@@ -76,6 +76,15 @@ def parse_args():
     parser.add_argument('--num_iters', type=int, default=30000)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--timesteps', type=int, default=120)
+    parser.add_argument('--randomize_horizon', type=str2bool, default=True,
+                        help='Enable random rollout horizon per episode '
+                             'during training')
+    parser.add_argument('--min_timesteps', type=int, default=80,
+                        help='Minimum rollout horizon when randomize_horizon '
+                             'is enabled')
+    parser.add_argument('--max_timesteps', type=int, default=180,
+                        help='Maximum rollout horizon when randomize_horizon '
+                             'is enabled')
     parser.add_argument('--grad_decay', type=float, default=0.8)
     parser.add_argument('--fov_x_half_tan', type=float, default=0.82)
     parser.add_argument('--control_hz', type=float, default=15.0)
@@ -107,7 +116,23 @@ def parse_args():
     parser.add_argument('--coef_collide', type=float, default=3.5)
     parser.add_argument('--coef_smooth', type=float, default=0.1)
     parser.add_argument('--coef_bias', type=float, default=0.5)
+    parser.add_argument('--coef_goal_stop', type=float, default=0.5)
     parser.add_argument('--coef_energy', type=float, default=0.05)
+    parser.add_argument('--goal_loss_radius', type=float, default=0.25,
+                        help='Training radius used by position/heading/speed '
+                             'losses; keep smaller than success_radius')
+    parser.add_argument('--success_radius', type=float, default=0.5,
+                        help='Evaluation radius used only by the success metric')
+    parser.add_argument('--near_goal_stop_radius', type=float, default=0.8,
+                        help='Distance at which the local stop loss turns on')
+    parser.add_argument('--near_goal_stop_temperature', type=float, default=0.1,
+                        help='Smooth transition width of the local stop loss')
+    parser.add_argument('--goal_stop_crawl_speed', type=float, default=0.3,
+                        help='Speeds at or below this crawl rate are exempt '
+                             'from the local stop loss so the robot keeps '
+                             'creeping into the goal centre')
+    parser.add_argument('--backward_loss_gain', type=float, default=2.0,
+                        help='Penalty multiplier for velocity away from goal')
     parser.add_argument('--avoid_safe_distance', type=float, default=1.0)
     parser.add_argument('--approach_speed_gain', type=float, default=1.0)
     parser.add_argument('--approach_speed_max', type=float, default=4.0)
@@ -116,6 +141,14 @@ def parse_args():
     parser.add_argument('--speed_min_scale', type=float, default=0.15)
     parser.add_argument('--speed_clearance_min', type=float, default=0.05)
     parser.add_argument('--speed_clearance_full', type=float, default=0.65)
+    parser.add_argument('--speed_window_size', type=int, default=30,
+                        help='Moving-average window in control steps for the '
+                             'velocity loss (30 steps ~ 2 s at 15 Hz)')
+    parser.add_argument('--speed_target_clearance_scale', type=str2bool,
+                        default=True,
+                        help='Scale the velocity-loss target by the perceived '
+                             'obstacle clearance. Turn off once the MPC '
+                             'safety filter owns corridor deceleration.')
 
     # --- waypoint policy (model_mpc.Model) ---
     parser.add_argument('--num_waypoints', type=int, default=3)
@@ -125,7 +158,7 @@ def parse_args():
     parser.add_argument('--max_speed', type=float, default=4.0)
     parser.add_argument('--max_omega', type=float, default=3.0)
     parser.add_argument('--initial_desired_speed', type=float, default=3.2)
-    parser.add_argument('--min_desired_speed', type=float, default=0.15)
+    parser.add_argument('--min_desired_speed', type=float, default=0.0)
 
     # --- MPC (mpc.DifferentiableWaypointMPC) ---
     parser.add_argument('--mpc_horizon', type=int, default=12)
@@ -227,6 +260,23 @@ def parse_args():
         parser.error('invalid avoidance-loss parameters')
     if args.speed_distance_gain <= 0.0:
         parser.error('--speed_distance_gain must be positive')
+    if args.speed_window_size < 1:
+        parser.error('--speed_window_size must be positive')
+    if not 0.0 <= args.goal_loss_radius < args.success_radius:
+        parser.error(
+            '--goal_loss_radius must be non-negative and below '
+            '--success_radius')
+    if args.near_goal_stop_radius <= args.goal_loss_radius:
+        parser.error(
+            '--near_goal_stop_radius must exceed --goal_loss_radius')
+    if args.near_goal_stop_temperature <= 0.0:
+        parser.error('--near_goal_stop_temperature must be positive')
+    if not 0.0 <= args.goal_stop_crawl_speed < args.max_speed:
+        parser.error(
+            '--goal_stop_crawl_speed must be in [0, max_speed)')
+    if args.coef_goal_stop < 0.0 or args.backward_loss_gain < 0.0:
+        parser.error(
+            '--coef_goal_stop and --backward_loss_gain must be non-negative')
     if not 0.0 <= args.min_desired_speed < args.initial_desired_speed:
         parser.error(
             '--min_desired_speed must be non-negative and below '
@@ -255,6 +305,10 @@ def parse_args():
             os.path.basename(args.run_name) != args.run_name
             or args.run_name in ('.', '..')):
         parser.error('--run_name must be one directory name, not a path')
+    if args.randomize_horizon:
+        if args.min_timesteps <= 0 or args.max_timesteps < args.min_timesteps:
+            parser.error('--min_timesteps must be positive and '
+                         '<= --max_timesteps')
     return args
 
 
@@ -358,7 +412,10 @@ def plot_trajectory(env, p_history, target_pos, i, writer,
 
     ``waypoint_history`` / ``mpc_trajectory_history`` are world-frame stacks
     of shape (T, B, N, 2); they are subsampled every 15 steps to avoid a
-    cluttered figure.  ``tag`` overrides the default TensorBoard image tag
+    cluttered figure.  Obstacles are drawn from the ``batch_idx``-th scene:
+    every batch element owns an independently sampled layout, so plotting
+    batch 0's geometry under another batch's path misrepresents the rollout.
+    ``tag`` overrides the default TensorBoard image tag
     (`Trajectory/Batch{batch_idx}{tag_suffix}`) so figures from different
     batches can share one fixed tag and stay browsable via TensorBoard's
     step slider instead of spawning a new tag per batch index.
@@ -370,7 +427,7 @@ def plot_trajectory(env, p_history, target_pos, i, writer,
     fig, ax = plt.subplots(figsize=(8, 8))
 
     if hasattr(env, 'cyl'):
-        cylinders = env.cyl[0].detach().cpu().numpy()
+        cylinders = env.cyl[batch_idx].detach().cpu().numpy()
         for obs in cylinders:
             circle = plt.Circle((obs[0], obs[1]), obs[2], color='gray', alpha=0.4)
             ax.add_artist(circle)
@@ -380,13 +437,13 @@ def plot_trajectory(env, p_history, target_pos, i, writer,
             ax.add_artist(circle_safe)
 
     if hasattr(env, 'balls'):
-        balls = env.balls[0].detach().cpu().numpy()
+        balls = env.balls[batch_idx].detach().cpu().numpy()
         for b in balls:
             circle = plt.Circle((b[0], b[1]), b[3], color='skyblue', alpha=0.4)
             ax.add_artist(circle)
 
     if hasattr(env, 'voxels'):
-        voxels = env.voxels[0].detach().cpu().numpy()
+        voxels = env.voxels[batch_idx].detach().cpu().numpy()
         for v in voxels:
             cx, cy = v[0], v[1]
             rx, ry = v[3], v[4]
@@ -488,12 +545,20 @@ def rollout(
     # synchronization formerly used to select the action delay.
     action_delay_steps = int(
         cpu_rng.integers(args.max_action_delay_steps + 1))
+    # Randomizing the horizon stops the GRU from encoding "step index" as a
+    # proxy for progress toward the goal, which otherwise collapses the
+    # desired speed onto its lower bound past the training horizon.
+    if getattr(args, 'randomize_horizon', False):
+        curr_timesteps = int(
+            cpu_rng.integers(args.min_timesteps, args.max_timesteps + 1))
+    else:
+        curr_timesteps = args.timesteps
     ctl_dts = np.maximum(
         0.01,
         cpu_rng.normal(
             1.0 / args.control_hz,
             args.dt_noise_std,
-            size=args.timesteps,
+            size=curr_timesteps,
         ),
     ).tolist()
 
@@ -562,8 +627,8 @@ def rollout(
         local_x = vec_global[:, 0] * cos_th + vec_global[:, 1] * sin_th
         local_y = vec_global[:, 0] * -sin_th + vec_global[:, 1] * cos_th
         dist_target = torch.sqrt(local_x ** 2 + local_y ** 2)
-        scale_mask = dist_target > 10.0
-        scale_factor = 10.0 / (dist_target + 1e-6)
+        scale_mask = dist_target > 6.0
+        scale_factor = 6.0 / (dist_target + 1e-6)
         scale = torch.where(scale_mask, scale_factor,
                             torch.ones_like(scale_factor))
 
@@ -572,11 +637,11 @@ def rollout(
         dist_target = dist_target * scale
 
         state = torch.stack([
-            local_x / 10.0,
-            local_y / 10.0,
+            local_x / 6.0,
+            local_y / 6.0,
             cos_th,
             sin_th,
-            dist_target / 10.0,
+            dist_target / 6.0,
             v_obs,
         ], dim=1)
 
@@ -687,7 +752,10 @@ def compute_losses(args, env, hist):
     act_stack = hist['act']        # (T, B, 2)  MPC commands (v, omega)
     surface_clearance = hist['surface_clearance']  # (T, B), signed
 
-    target_expanded = env.p_target.unsqueeze(0).expand(args.timesteps, -1, -1)
+    # The rollout horizon is dynamic, so broadcast the target against the
+    # actual stacked time dimension instead of args.timesteps.
+    T = p_stack.shape[0]
+    target_expanded = env.p_target.unsqueeze(0).expand(T, -1, -1)
 
     vec_to_target_all = target_expanded[..., :2] - p_stack[..., :2]
     dist_all_steps = torch.norm(vec_to_target_all + 1e-8, dim=-1)
@@ -699,41 +767,66 @@ def compute_losses(args, env, hist):
         [torch.cos(cur_yaw_all), torch.sin(cur_yaw_all)], dim=-1)
 
     # 1. Pos loss
-    arrival_tolerance = 1.0
-    loss_pos = F.relu(dist_all_steps - arrival_tolerance).mean()
+    loss_pos = F.relu(dist_all_steps - args.goal_loss_radius).mean()
 
     # 2. Heading loss
-    mask_heading = (dist_all_steps > arrival_tolerance).float()
+    mask_heading = (dist_all_steps > args.goal_loss_radius).float()
     raw_heading_loss = 1.0 - F.cosine_similarity(
         cur_dir_all, dir_to_target_all, dim=-1)
     loss_heading = (raw_heading_loss * mask_heading).sum() \
         / (mask_heading.sum() + 1e-5)
 
-    # 3. Velocity loss. Track a per-step target so the policy learns to slow
-    # near obstacles and accelerate again in open space. ``surface_clearance``
-    # is centre-to-surface distance; subtracting the robot radius converts it
-    # to body clearance. Detaching the target prevents the policy from reducing
-    # this loss by manipulating its own position or clearance.
+    # 3. Velocity loss.  Tracking a per-step target trains the GRU to encode
+    # the timestep itself as a braking cue (the desired speed then collapses
+    # onto its lower bound once deployment runs past the training horizon),
+    # while a single episode mean drops every local dynamic constraint.  A
+    # moving window keeps a ~2 s progress-rate constraint yet breaks the
+    # absolute step -> speed coupling: a transient brake while squeezing
+    # through a corridor is free as long as the window mean keeps up.  Prefix
+    # sums turn the window mean into O(1) slicing, and both sides are averaged
+    # over the same window so the target does not lag the measurement through
+    # the arrival transient.
     goal_speed = torch.clamp(
-        (dist_to_target_vec - arrival_tolerance) * args.speed_distance_gain,
+        (dist_to_target_vec - args.goal_loss_radius)
+        * args.speed_distance_gain,
         0.0,
         args.max_speed,
     )
-    body_clearance = surface_clearance - args.robot_radius
-    clearance_scale = torch.clamp(
-        (
-            body_clearance - args.speed_clearance_min
-        ) / (
-            args.speed_clearance_full - args.speed_clearance_min
-        ),
-        min=args.speed_min_scale,
-        max=1.0,
-    )
-    target_speed_scalar = (
-        goal_speed * clearance_scale.unsqueeze(-1)
-    ).detach()
-    loss_velocity_scalar = F.smooth_l1_loss(
-        v_stack, target_speed_scalar)
+    if args.speed_target_clearance_scale:
+        # ``surface_clearance`` is centre-to-surface distance; subtracting the
+        # robot radius converts it to body clearance. Detaching the target
+        # prevents the policy from reducing this loss by manipulating its own
+        # position or clearance.
+        body_clearance = surface_clearance - args.robot_radius
+        clearance_scale = torch.clamp(
+            (
+                body_clearance - args.speed_clearance_min
+            ) / (
+                args.speed_clearance_full - args.speed_clearance_min
+            ),
+            min=args.speed_min_scale,
+            max=1.0,
+        )
+        target_speed_scalar = (
+            goal_speed * clearance_scale.unsqueeze(-1)).detach()
+    else:
+        target_speed_scalar = goal_speed.detach()
+
+    window = max(1, args.speed_window_size)
+    if T > window:
+        v_cum = v_stack.cumsum(dim=0)                     # (T, B, 1)
+        target_cum = target_speed_scalar.cumsum(dim=0)
+        # Window i averages the ``window`` control steps ending at index i.
+        v_window_avg = (v_cum[window:] - v_cum[:-window]) / window
+        target_window_avg = (
+            target_cum[window:] - target_cum[:-window]) / window
+        loss_velocity_scalar = F.smooth_l1_loss(
+            v_window_avg, target_window_avg)
+    else:
+        # Episodes not longer than the window fall back to the full-sequence
+        # mean so the term stays defined for any horizon.
+        loss_velocity_scalar = F.smooth_l1_loss(
+            v_stack.mean(dim=0), target_speed_scalar.mean(dim=0))
 
     # 4. Avoidance loss. The finite-difference approach speed only changes
     # the importance of a frame; detaching it guarantees that the spatial
@@ -757,24 +850,50 @@ def compute_losses(args, env, hist):
     # 6. Smooth loss (on executed MPC commands)
     loss_smooth = (act_stack.diff(1, 0) / AVG_DT).pow(2).mean()
 
-    # 7. Bias loss (keep velocity vector aligned with the target direction)
+    # 7. Direction loss. The former projection-only loss penalized lateral
+    # motion but assigned zero loss to motion directly away from the goal.
+    # Retain its lateral component and explicitly penalize negative radial
+    # progress.
     v_real_vec = torch.stack([
         v_stack[..., 0] * torch.cos(theta_stack[..., 2]),
         v_stack[..., 0] * torch.sin(theta_stack[..., 2])
     ], dim=-1)
-    v_proj_val = (v_real_vec * dir_to_target_all).sum(dim=-1, keepdim=True)
-    v_proj_vec = v_proj_val * dir_to_target_all
-    loss_bias = F.mse_loss(v_real_vec, v_proj_vec)
+    radial_speed = (v_real_vec * dir_to_target_all).sum(dim=-1)
+    lateral_velocity = (
+        v_real_vec - radial_speed.unsqueeze(-1) * dir_to_target_all
+    )
+    loss_lateral = lateral_velocity.pow(2).sum(dim=-1).mean()
+    loss_backward = F.relu(-radial_speed).pow(2).mean()
+    loss_bias = loss_lateral + args.backward_loss_gain * loss_backward
 
-    # 8. Energy loss
+    # 8. Distance-gated local stop loss. Detaching the gate prevents the
+    # policy from reducing this term by deliberately moving away from the
+    # goal. Unlike global per-step speed supervision, this cue depends on the
+    # observed goal distance rather than the absolute rollout timestep.  Only
+    # speeds above the crawl threshold are penalized: punishing every bit of
+    # motion would make a full stop (allowed by min_desired_speed = 0) the
+    # cheapest option and the robot freezes just outside the goal.
+    near_goal_weight = torch.sigmoid(
+        (args.near_goal_stop_radius - dist_all_steps)
+        / args.near_goal_stop_temperature
+    ).detach()
+    over_crawl = F.relu(v_stack[..., 0] - args.goal_stop_crawl_speed)
+    loss_goal_stop = (
+        near_goal_weight * over_crawl.pow(2)
+    ).sum() / near_goal_weight.sum().clamp_min(1e-6)
+
+    # 9. Energy loss
     loss_action_energy = act_stack.pow(2).mean()
 
-    # 9. Success / collision metrics (logged, not part of the loss)
-    # Success: entered the 1 m goal radius at any timestep AND no collision
+    # 10. Success / collision metrics (logged, not part of the loss)
+    # Success: entered the configured evaluation radius at any timestep and
+    # had no collision
     # over the whole episode. Physical contact occurs when centre-to-surface
     # signed clearance is no greater than the robot radius.
     with torch.no_grad():
-        reached_goal = (dist_all_steps <= arrival_tolerance).any(dim=0)   # (B,)
+        reached_goal = (
+            dist_all_steps <= args.success_radius
+        ).any(dim=0)                                                   # (B,)
         collided = (surface_clearance <= env.drone_radius).any(dim=0)    # (B,)
         success_rate = (reached_goal & ~collided).float().mean()
         collision_rate = collided.float().mean()
@@ -786,6 +905,7 @@ def compute_losses(args, env, hist):
         + args.coef_collide * loss_collide \
         + args.coef_smooth * loss_smooth \
         + args.coef_bias * loss_bias \
+        + args.coef_goal_stop * loss_goal_stop \
         + args.coef_energy * loss_action_energy
 
     parts = {
@@ -797,6 +917,7 @@ def compute_losses(args, env, hist):
         'Loss/Collide': loss_collide,
         'Loss/Smooth': loss_smooth,
         'Loss/Bias': loss_bias,
+        'Loss/GoalStop': loss_goal_stop,
         'Loss/Energy': loss_action_energy,
         'Metric/FinalDist': dist_all_steps[-1].mean(),
         'Metric/MeanSpeed': v_stack.mean(),
@@ -908,6 +1029,7 @@ def main():
         'Loss/Collide',
         'Loss/Smooth',
         'Loss/Bias',
+        'Loss/GoalStop',
         'Loss/Energy',
         'Metric/FinalDist',
         'Metric/MeanSpeed',

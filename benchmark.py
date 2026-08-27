@@ -124,7 +124,7 @@ def build_parser():
     parser.add_argument("--max-speed", type=float, default=4.0)
     parser.add_argument("--max-omega", type=float, default=3.0)
     parser.add_argument("--initial-desired-speed", type=float, default=3.0)
-    parser.add_argument("--min-desired-speed", type=float, default=0.15)
+    parser.add_argument("--min-desired-speed", type=float, default=0.0)
 
     # MPC and optional perception-safety configuration.
     parser.add_argument("--mpc-horizon", type=int, default=12)

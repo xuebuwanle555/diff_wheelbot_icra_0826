@@ -6,15 +6,24 @@
 # 注意：障碍数量已从 20/12/8 降为 14/8/6（原密度几乎堵死通道）；
 #       如需严格对齐 X-NavDP clutter 基准分布，请恢复原数量与半径。
 #
+# 防速度坍缩：启用随机 rollout 时域（randomize_horizon）并将速度损失改为
+# 回合均值形式，避免 GRU 把步数当作进度线索，导致部署超过训练时域后
+# desired_speed 塌缩到 min_desired_speed。
+#
 # 用法：python3 train_mpc.py @configs/xnavdp_dense_corridor_v2.args
 # 命令行中出现在 @file 之后的参数会覆盖本文件中的取值。
 # =========================================================================
 
 # ---------------- 基础训练设置 ----------------
 --batch_size 256            
---num_iters 30000          
+--num_iters 20000          
 --lr 0.0001                
---timesteps 120            
+# 基准步长仅在 randomize_horizon=false 时生效；开启时域随机化后，每个
+# episode 的步数在 [min_timesteps, max_timesteps] 内均匀采样。
+--timesteps 120             # 固定 rollout 步长（关闭随机化时使用）
+--randomize_horizon true    # 逐 episode 随机采样 rollout 步长
+--min_timesteps 135          # 随机时域下界
+--max_timesteps 165         # 随机时域上界
 --grad_decay 0.4            
 --fov_x_half_tan 0.82       
 --control_hz 15.0           
@@ -35,25 +44,38 @@
 --plot_interval 500         
 
 # ---------------- loss 权重 ----------------
---coef_pos 1.0              
---coef_v 0.25              
---coef_heading 0.4         
+--coef_pos 1.2              
+--coef_v 0.8              
+--coef_heading 1.0         
 --coef_obj_avoidance 0.5 
---coef_collide 3.0         
---coef_smooth 0.05          
---coef_bias 0.4      
+--coef_collide 3.5         
+--coef_smooth 0.06          
+--coef_bias 0.2      
+--coef_goal_stop 0.3        # 近目标残余速度约束（原 0.5 过强易提前停死）
 --coef_energy 0.00          
+--goal_loss_radius 0.25     # 训练收敛半径，小于评测成功半径以保留裕量
+--success_radius 0.50       # 成功率仍按进入 0.5 m 判定
+--near_goal_stop_radius 0.60       # 从该距离开始平滑加强停车约束（原 0.8，
+#   门控太早导致 1 m 外就开始减速）
+--near_goal_stop_temperature 0.10  # 停车权重的距离过渡宽度
+--goal_stop_crawl_speed 0.30       # 低于该爬行速度不再惩罚，保留蠕行进点的梯度
+--backward_loss_gain 2.0    # 明确惩罚朝远离目标方向运动
 --avoid_safe_distance 0.40  
 --approach_speed_gain 1.0   
 --approach_speed_max 2.0    
 --collision_soft_clearance 0.25 
 
-# 逐步、感知间隙自适应的期望速度：间隙从 0.24 m 圆形 Dingo 代理的
-# 机体表面起算，间隙越窄期望速度越低。
---speed_distance_gain 0.30  # 距目标距离→期望速度增益
---speed_min_scale 0.30      # 间隙最窄时期望速度保留比例
+# 期望速度目标：由距目标距离决定巡航意图，再按感知间隙线性压低（间隙从
+# 0.24 m 圆形 Dingo 代理的机体表面起算）。速度损失不逐步点对点监督，而是
+# 约束滑动窗口内的平均前进速度，避免 GRU 把步数当成减速线索。
+--speed_window_size 30      # 速度损失滑动窗口步数（30 步 ≈ 2 s @15 Hz）
+--speed_distance_gain 0.50  # 距目标距离→期望速度增益
+--speed_min_scale 0.50      # 间隙最窄时期望速度保留比例
 --speed_clearance_min 0.05  # 开始降速的机体间隙 (m)
 --speed_clearance_full 0.55 # 恢复满速期望的机体间隙 (m)
+--speed_target_clearance_scale true  # 是否用感知间隙压低期望速度
+#   设为 false 后期望速度仅由距目标距离决定，通道内减速完全交给 MPC
+#   安全滤波；仅当 --mpc_perception_safety true 时才建议关闭。
 
 # ---------------- 策略网络 (model_mpc.Model) ----------------
 --num_waypoints 3           # 输出的局部航路点数量
@@ -63,7 +85,7 @@
 --max_speed 2.0             
 --max_omega 3.0             
 --initial_desired_speed 1.5 # 期望速度头初始偏置
---min_desired_speed 0.15    # 防止循环隐状态漂移时速度头塌缩到 0
+--min_desired_speed 0.0     # 允许策略在需要时输出真实的零速度
 
 # ---------------- MPC (mpc.DifferentiableWaypointMPC) ----------------
 --mpc_horizon 12            # MPC 轨迹时域步数
@@ -89,7 +111,7 @@
 --emergency_ttc 0.7             # 紧急模式触发碰撞时间
 
 # ---------------- 环境设置 ----------------
---map_size 12.0            
+--map_size 14.0            
 --num_cyl 16                
 --num_balls 10               
 --num_vox 8                 
@@ -103,7 +125,7 @@
 --env_height 48         
 --diff_nearest_pt true      # 是否用 CUDA 解析梯度求最近障碍物点（train_mpc 实际未使用）
 --randomize_start_goal true # 每个 rollout 在四个角中随机选择起点，终点取对角点
---protected_zone_radius 1.5 # 起点/终点周围禁止障碍物表面进入的半径 (m)
+--protected_zone_radius 1.0 # 起点/终点周围禁止障碍物表面进入的半径 (m)
 
 # ---------------- 障碍布局 ----------------
 # 分层（stratified）快速采样：候选来自抖动网格单元，覆盖比独立均匀采样
