@@ -90,7 +90,7 @@ class Env:
                  cyl_radius_min=0.2, cyl_radius_max=0.5,
                  ball_radius_min=0.2, ball_radius_max=0.4,
                  ball_radius_floor=0.0,
-                 start_pos=(-5.0, -5.0), target_pos=(5.0, 5.0),
+                 start_pos=(-4.5, -4.5), target_pos=(4.5, 4.5),
                  randomize_start_goal=False, initial_yaw_noise=0.26,
                  protected_zone_radius=2.0,
                  obstacle_min_surface_gap=0.0,
@@ -453,7 +453,14 @@ class Env:
         vox_xy = all_xy[:, n_cyl + n_balls:]
 
         self.cyl = torch.cat([cyl_xy, cyl_r], dim=-1)
-        ball_zr = torch.cat([ball_r, ball_r], dim=-1)
+        # Ball centre height varies per instance, sampled uniformly from
+        # half-buried (centre at z = 0) to floating 0.2 m above the ground
+        # (centre at z = r + 0.2). This diversifies the rendered depth
+        # signature; planar clearance ignores ball height, so it does not
+        # change the collision/avoidance geometry.
+        ball_lift = torch.rand(
+            ball_r.shape, device=self.device) * (ball_r + 0.2)
+        ball_zr = torch.cat([ball_lift, ball_r], dim=-1)
         self.balls = torch.cat([ball_xy, ball_zr], dim=-1)
 
         vox_rz = torch.full((self.batch_size, n_vox, 1), 0.5, device=self.device)

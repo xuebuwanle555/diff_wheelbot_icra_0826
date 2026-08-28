@@ -24,7 +24,7 @@
 --randomize_horizon true    # 逐 episode 随机采样 rollout 步长
 --min_timesteps 135          # 随机时域下界
 --max_timesteps 165         # 随机时域上界
---grad_decay 0.4            
+--grad_decay 0.6            
 --fov_x_half_tan 0.82       
 --control_hz 15.0           
 --dt_noise_std 0.005        
@@ -44,15 +44,15 @@
 --plot_interval 500         
 
 # ---------------- loss 权重 ----------------
---coef_pos 1.2              
---coef_v 0.8              
---coef_heading 1.0         
---coef_obj_avoidance 0.5 
+--coef_pos 1.0              
+--coef_v 0.6              
+--coef_heading 0.4         
+--coef_obj_avoidance 0.8 
 --coef_collide 3.5         
---coef_smooth 0.06          
---coef_bias 0.2      
+--coef_smooth 0.15          
+--coef_bias 0.3      
 --coef_goal_stop 0.3        # 近目标残余速度约束（原 0.5 过强易提前停死）
---coef_energy 0.00          
+--coef_energy 0.02          
 --goal_loss_radius 0.25     # 训练收敛半径，小于评测成功半径以保留裕量
 --success_radius 0.50       # 成功率仍按进入 0.5 m 判定
 --near_goal_stop_radius 0.60       # 从该距离开始平滑加强停车约束（原 0.8，
@@ -60,7 +60,7 @@
 --near_goal_stop_temperature 0.10  # 停车权重的距离过渡宽度
 --goal_stop_crawl_speed 0.30       # 低于该爬行速度不再惩罚，保留蠕行进点的梯度
 --backward_loss_gain 2.0    # 明确惩罚朝远离目标方向运动
---avoid_safe_distance 0.40  
+--avoid_safe_distance 0.50  
 --approach_speed_gain 1.0   
 --approach_speed_max 2.0    
 --collision_soft_clearance 0.25 
@@ -85,7 +85,8 @@
 --max_speed 2.0             
 --max_omega 3.0             
 --initial_desired_speed 1.5 # 期望速度头初始偏置
---min_desired_speed 0.0     # 允许策略在需要时输出真实的零速度
+--min_desired_speed 0.1     # 速度下限保底：抬起低速“无重力区”，防碰撞后
+#   速度头锁死贴地；配合 GoalStop 爬行豁免（0.3）不阻碍正常进点停车
 
 # ---------------- MPC (mpc.DifferentiableWaypointMPC) ----------------
 --mpc_horizon 12            # MPC 轨迹时域步数
@@ -112,13 +113,13 @@
 
 # ---------------- 环境设置 ----------------
 --map_size 14.0            
---num_cyl 16                
+--num_cyl 18                
 --num_balls 10               
 --num_vox 8                 
 --robot_radius 0.24         
---cyl_radius_min 0.20       
+--cyl_radius_min 0.15       
 --cyl_radius_max 0.45       
---ball_radius_min 0.20      
+--ball_radius_min 0.15      
 --ball_radius_max 0.45      
 --ball_radius_floor 0.25    
 --env_width 64             
