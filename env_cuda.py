@@ -90,7 +90,7 @@ class Env:
                  cyl_radius_min=0.2, cyl_radius_max=0.5,
                  ball_radius_min=0.2, ball_radius_max=0.4,
                  ball_radius_floor=0.0,
-                 start_pos=(-4.5, -4.5), target_pos=(4.5, 4.5),
+                 start_pos=(-4.0, -4.0), target_pos=(4.0, 4.0),
                  randomize_start_goal=False, initial_yaw_noise=0.26,
                  protected_zone_radius=2.0,
                  obstacle_min_surface_gap=0.0,

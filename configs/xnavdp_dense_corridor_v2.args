@@ -24,7 +24,7 @@
 --randomize_horizon true    # 逐 episode 随机采样 rollout 步长
 --min_timesteps 135          # 随机时域下界
 --max_timesteps 165         # 随机时域上界
---grad_decay 0.6            
+--grad_decay 0.8            
 --fov_x_half_tan 0.82       
 --control_hz 15.0           
 --dt_noise_std 0.005        
@@ -46,13 +46,14 @@
 # ---------------- loss 权重 ----------------
 --coef_pos 1.0              
 --coef_v 0.6              
---coef_heading 0.4         
---coef_obj_avoidance 0.8 
+--coef_heading 0.6         
+--coef_obj_avoidance 0.6 
 --coef_collide 3.5         
---coef_smooth 0.15          
+--coef_smooth 0.2          
 --coef_bias 0.3      
 --coef_goal_stop 0.3        # 近目标残余速度约束（原 0.5 过强易提前停死）
---coef_energy 0.02          
+--coef_energy 0.05          
+--goal_state_max_distance 6.0  # 策略状态向量中目标坐标的截断/缩放半径，必须与部署端 --goal_state_max_distance 一致
 --goal_loss_radius 0.25     # 训练收敛半径，小于评测成功半径以保留裕量
 --success_radius 0.50       # 成功率仍按进入 0.5 m 判定
 --near_goal_stop_radius 0.60       # 从该距离开始平滑加强停车约束（原 0.8，
@@ -60,7 +61,7 @@
 --near_goal_stop_temperature 0.10  # 停车权重的距离过渡宽度
 --goal_stop_crawl_speed 0.30       # 低于该爬行速度不再惩罚，保留蠕行进点的梯度
 --backward_loss_gain 2.0    # 明确惩罚朝远离目标方向运动
---avoid_safe_distance 0.50  
+--avoid_safe_distance 0.45  
 --approach_speed_gain 1.0   
 --approach_speed_max 2.0    
 --collision_soft_clearance 0.25 
@@ -84,16 +85,16 @@
 --max_lateral_step 1.0      # 航路点横向步长上限（米）
 --max_speed 2.0             
 --max_omega 3.0             
---initial_desired_speed 1.5 # 期望速度头初始偏置
+--initial_desired_speed 1.7 # 期望速度头初始偏置
 --min_desired_speed 0.1     # 速度下限保底：抬起低速“无重力区”，防碰撞后
 #   速度头锁死贴地；配合 GoalStop 爬行豁免（0.3）不阻碍正常进点停车
 
 # ---------------- MPC (mpc.DifferentiableWaypointMPC) ----------------
 --mpc_horizon 12            # MPC 轨迹时域步数
 --mpc_control_lookahead 3   # 纯跟踪控制前瞻步
---mpc_max_acc_v 8.0         # 线加速度上限
---mpc_max_acc_omega 10.0    # 角加速度上限
---mpc_max_lateral_acc 7.0   # 侧向加速度上限
+--mpc_max_acc_v 3.0         # 线加速度上限
+--mpc_max_acc_omega 5.0    # 角加速度上限
+--mpc_max_lateral_acc 6.0   # 侧向加速度上限
 --mpc_track_weight 8.0      # 航路点跟踪权重
 --mpc_smooth_weight 30.0    # 轨迹平滑权重
 --mpc_initial_velocity_weight 4.0  # 初始速度一致性权重
@@ -113,9 +114,9 @@
 
 # ---------------- 环境设置 ----------------
 --map_size 14.0            
---num_cyl 18                
---num_balls 10               
---num_vox 8                 
+--num_cyl 19                
+--num_balls 11               
+--num_vox 9                 
 --robot_radius 0.24         
 --cyl_radius_min 0.15       
 --cyl_radius_max 0.45       
@@ -126,7 +127,7 @@
 --env_height 48         
 --diff_nearest_pt true      # 是否用 CUDA 解析梯度求最近障碍物点（train_mpc 实际未使用）
 --randomize_start_goal true # 每个 rollout 在四个角中随机选择起点，终点取对角点
---protected_zone_radius 1.0 # 起点/终点周围禁止障碍物表面进入的半径 (m)
+--protected_zone_radius 0.6 # 起点/终点周围禁止障碍物表面进入的半径 (m)
 
 # ---------------- 障碍布局 ----------------
 # 分层（stratified）快速采样：候选来自抖动网格单元，覆盖比独立均匀采样

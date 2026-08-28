@@ -1,0 +1,93 @@
+# =========================================================================
+# PPO baseline：与主模型 (xnavdp_dense_corridor_v2) 相同环境分布的
+# 直接动作循环 PPO 训练配置。
+#
+# 环境块照抄 configs/xnavdp_dense_corridor_v2.args，保证基准对比时两者
+# 面对同一场景分布；PPO 超参与奖励权重独立于主模型，可单独调整。
+#
+# 用法：python3 train_ppo.py @configs/ppo_train.args
+# 命令行中出现在 @file 之后的参数会覆盖本文件中的取值。
+# =========================================================================
+
+# ---------------- 基础训练设置 ----------------
+--batch_size 256              # 并行 CUDA 环境数
+--rollout_steps 150           # 每次 PPO 更新的 rollout 步数（主模型时域 135~165）
+--total_timesteps 20000000    # 总环境步数预算
+--save_every 50               # checkpoint 间隔（PPO 更新次数）
+--lr 0.0003
+--gamma 0.99
+--gae_lambda 0.95
+--clip_coef 0.2
+--value_coef 0.5
+--entropy_coef 0.01
+--max_grad_norm 0.5
+--update_epochs 4
+--minibatch_envs 32           # 每个 minibatch 的完整循环轨迹条数
+--target_kl 0.03
+--initial_log_std -0.7
+--anneal_lr true              # 随剩余步数线性衰减学习率
+--seed 0
+
+# ---------------- checkpoint / 日志 ----------------
+--save_dir save/ppo_baseline
+--log_dir runs/ppo_baseline
+
+# ---------------- 速度 / 目标 ----------------
+--max_speed 2.0               # 与主模型一致
+--max_omega 3.0
+--cruise_v 1.5                # 策略初始速度偏置（对应主模型 initial_desired_speed）
+--goal_stop_distance 0.5      # 进入该半径即判定到达并结束回合
+--safety_margin 0.25          # 间隙惩罚的安全裕量（机体表面到障碍表面）
+
+# ---------------- 执行器随机化（与主模型训练配置一致） ----------------
+--control_hz 15.0
+--dt_noise_std 0.005
+--min_ctl_dt 0.01
+--motor_rate_min 3.0
+--motor_rate_max 8.0
+--max_action_delay_steps 1
+--exec_v_scale_std 0.0
+--exec_w_scale_std 0.0
+--wheel_bias_std 0.0
+
+# ---------------- 观测 ----------------
+--depth_noise_std 0.02        # 深度逆映射加性噪声（主模型固定 0.02）
+--fov_x_half_tan 0.82
+--grad_decay 0.6
+--env_width 64
+--env_height 48
+
+# ---------------- PPO 奖励权重 ----------------
+--reward_progress 2.0         # 朝目标推进 (距离减少量 × 权重)
+--reward_arrival 25.0         # 到达终点一次性奖励
+--reward_collision -25.0      # 碰撞一次性惩罚
+--reward_clearance 0.5        # 间隙低于 safety_margin 的比例惩罚
+--reward_time -0.01           # 每步时间惩罚
+--reward_smooth 0.05          # 指令平滑惩罚（归一化增量平方和）
+--reward_omega 0.01           # 角速度使用惩罚
+
+# ---------------- 环境设置（照抄 xnavdp_dense_corridor_v2.args） ----------------
+--map_size 14.0
+--num_cyl 18
+--num_balls 10
+--num_vox 8
+--robot_radius 0.24
+--cyl_radius_min 0.15
+--cyl_radius_max 0.45
+--ball_radius_min 0.15
+--ball_radius_max 0.45
+--ball_radius_floor 0.25
+--initial_yaw_noise 0.26      # Env 默认值（主模型训练未显式传入）
+--randomize_start_goal true   # 四个角随机起点，终点取对角点
+--protected_zone_radius 1.0
+
+# ---------------- 障碍布局 ----------------
+--obstacle_layout stratified
+--obstacle_grid_jitter 0.35
+--obstacle_candidate_multiplier 2.0
+
+# ---------------- 动态障碍（与主模型训练一致：关闭） ----------------
+--dynamic_obstacle_scene_prob 0.0
+--dynamic_obstacle_ratio 0.0
+--dynamic_obstacle_speed_min 0.0
+--dynamic_obstacle_speed_max 0.0

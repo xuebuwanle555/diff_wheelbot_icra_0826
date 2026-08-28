@@ -118,6 +118,10 @@ def parse_args():
     parser.add_argument('--coef_bias', type=float, default=0.5)
     parser.add_argument('--coef_goal_stop', type=float, default=0.5)
     parser.add_argument('--coef_energy', type=float, default=0.05)
+    parser.add_argument('--goal_state_max_distance', type=float, default=6.0,
+                        help='Clamp/scale radius for goal coordinates in the '
+                             'policy state vector; must match the deployment '
+                             'script --goal_state_max_distance')
     parser.add_argument('--goal_loss_radius', type=float, default=0.25,
                         help='Training radius used by position/heading/speed '
                              'losses; keep smaller than success_radius')
@@ -627,8 +631,8 @@ def rollout(
         local_x = vec_global[:, 0] * cos_th + vec_global[:, 1] * sin_th
         local_y = vec_global[:, 0] * -sin_th + vec_global[:, 1] * cos_th
         dist_target = torch.sqrt(local_x ** 2 + local_y ** 2)
-        scale_mask = dist_target > 6.0
-        scale_factor = 6.0 / (dist_target + 1e-6)
+        scale_mask = dist_target > args.goal_state_max_distance
+        scale_factor = args.goal_state_max_distance / (dist_target + 1e-6)
         scale = torch.where(scale_mask, scale_factor,
                             torch.ones_like(scale_factor))
 
@@ -636,13 +640,16 @@ def rollout(
         local_y = local_y * scale
         dist_target = dist_target * scale
 
+        # Speed is normalised by the configured cap so the state is
+        # invariant to max_speed; the deployment script must divide by the
+        # same value (policy_max_v, aligned from the checkpoint).
         state = torch.stack([
-            local_x / 6.0,
-            local_y / 6.0,
+            local_x / args.goal_state_max_distance,
+            local_y / args.goal_state_max_distance,
             cos_th,
             sin_th,
-            dist_target / 6.0,
-            v_obs,
+            dist_target / args.goal_state_max_distance,
+            v_obs / args.max_speed,
         ], dim=1)
 
         # ---- waypoint policy --> MPC --> (v, omega) ----------------------
