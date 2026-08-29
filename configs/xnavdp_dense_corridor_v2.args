@@ -16,7 +16,7 @@
 
 # ---------------- 基础训练设置 ----------------
 --batch_size 256            
---num_iters 20000          
+--num_iters 12000          
 --lr 0.0001                
 # 基准步长仅在 randomize_horizon=false 时生效；开启时域随机化后，每个
 # episode 的步数在 [min_timesteps, max_timesteps] 内均匀采样。
@@ -38,22 +38,23 @@
 
 # ---------------- checkpoint / 日志 ----------------
 --save_dir save/xnavdp_dense_corridor_v2  
---log_dir runs/xnavdp_dense_corridor_v2    
---ckpt_interval 2500        
+--log_dir runs/xnavdp_dense_corridor_v2
+--ckpt_interval 3000        
 --log_interval 25           
 --plot_interval 500         
 
 # ---------------- loss 权重 ----------------
---coef_pos 1.0              
---coef_v 0.6              
---coef_heading 0.6         
+--coef_pos 1.2              
+--coef_v 0.7              
+--coef_heading 0.7         
 --coef_obj_avoidance 0.6 
 --coef_collide 3.5         
---coef_smooth 0.2          
---coef_bias 0.3      
+--coef_smooth 0.15          
+--coef_bias 0.4      
 --coef_goal_stop 0.3        # 近目标残余速度约束（原 0.5 过强易提前停死）
+--coef_speed_head 0.15      # 保留速度头直接监督，但避免压过导航/避障目标
 --coef_energy 0.05          
---goal_state_max_distance 6.0  # 策略状态向量中目标坐标的截断/缩放半径，必须与部署端 --goal_state_max_distance 一致
+--goal_state_max_distance 10.0  # 策略状态向量中目标坐标的截断/缩放半径，必须与部署端 --goal_state_max_distance 一致（20260829 起 G=6→10，目标 12.7m 对角开局仍会截断到 10）
 --goal_loss_radius 0.25     # 训练收敛半径，小于评测成功半径以保留裕量
 --success_radius 0.50       # 成功率仍按进入 0.5 m 判定
 --near_goal_stop_radius 0.60       # 从该距离开始平滑加强停车约束（原 0.8，
@@ -61,19 +62,19 @@
 --near_goal_stop_temperature 0.10  # 停车权重的距离过渡宽度
 --goal_stop_crawl_speed 0.30       # 低于该爬行速度不再惩罚，保留蠕行进点的梯度
 --backward_loss_gain 2.0    # 明确惩罚朝远离目标方向运动
---avoid_safe_distance 0.45  
+--avoid_safe_distance 0.45  # 稍早建立训练侧的障碍安全梯度
 --approach_speed_gain 1.0   
 --approach_speed_max 2.0    
---collision_soft_clearance 0.25 
+--collision_soft_clearance 0.25
 
-# 期望速度目标：由距目标距离决定巡航意图，再按感知间隙线性压低（间隙从
+# 期望速度目标：由距目标距离决定巡航意图，再按感知间隙线性压低
 # 0.24 m 圆形 Dingo 代理的机体表面起算）。速度损失不逐步点对点监督，而是
 # 约束滑动窗口内的平均前进速度，避免 GRU 把步数当成减速线索。
 --speed_window_size 30      # 速度损失滑动窗口步数（30 步 ≈ 2 s @15 Hz）
 --speed_distance_gain 0.50  # 距目标距离→期望速度增益
---speed_min_scale 0.50      # 间隙最窄时期望速度保留比例
---speed_clearance_min 0.05  # 开始降速的机体间隙 (m)
---speed_clearance_full 0.55 # 恢复满速期望的机体间隙 (m)
+--speed_min_scale 0.45      # 极窄间隙仅保留 25% 速度目标
+--speed_clearance_min 0.15  # 接近机体表面时进入最低速度比例 (m)
+--speed_clearance_full 0.50 # 机体间隙达到该值才恢复满速目标 (m)
 --speed_target_clearance_scale true  # 是否用感知间隙压低期望速度
 #   设为 false 后期望速度仅由距目标距离决定，通道内减速完全交给 MPC
 #   安全滤波；仅当 --mpc_perception_safety true 时才建议关闭。
@@ -90,18 +91,18 @@
 #   速度头锁死贴地；配合 GoalStop 爬行豁免（0.3）不阻碍正常进点停车
 
 # ---------------- MPC (mpc.DifferentiableWaypointMPC) ----------------
---mpc_horizon 12            # MPC 轨迹时域步数
+--mpc_horizon 12            # MPC 轨迹时域步
 --mpc_control_lookahead 3   # 纯跟踪控制前瞻步
---mpc_max_acc_v 3.0         # 线加速度上限
+--mpc_max_acc_v 3.0         #
 --mpc_max_acc_omega 5.0    # 角加速度上限
---mpc_max_lateral_acc 6.0   # 侧向加速度上限
+--mpc_max_lateral_acc 5.0   #
 --mpc_track_weight 8.0      # 航路点跟踪权重
 --mpc_smooth_weight 30.0    # 轨迹平滑权重
 --mpc_initial_velocity_weight 4.0  # 初始速度一致性权重
---mpc_obstacle_clearance 0.38      # 感知避障安全间距（米）【仅 mpc_perception_safety=true 时生效】
+--mpc_obstacle_clearance 0.35      # 深度感知轨迹安全间距（米）
 --mpc_obstacle_temperature 0.15    # 避障软化温度【仅 mpc_perception_safety=true 时生效】
 --mpc_obstacle_refine_steps 2      # 避障轨迹修正迭代步数【仅 mpc_perception_safety=true 时生效】
---mpc_perception_safety false      # 是否启用深度感知避障修正（false 时上方感知避障参数不参与计算）
+--mpc_perception_safety false      # 关闭会改变策略轨迹几何的深度安全修正
 
 # ---------------- 感知处理（仅 mpc_perception_safety=true 时生效） ----------------
 --obstacle_num_points 16    # 深度图提取的障碍物扇区点数
@@ -109,17 +110,19 @@
 --obstacle_depth_quantile 0.1   # 每扇区深度分位数
 --obstacle_min_range 0.2        # 最近感知距离
 --obstacle_max_range 6.0        # 最远感知距离
---emergency_distance 1.2        # 紧急模式触发距离
---emergency_ttc 0.7             # 紧急模式触发碰撞时间
+--emergency_distance 1.5        # 更早触发近障紧急模式
+--emergency_ttc 1.0             # 更早根据接近速度触发制动
 
 # ---------------- 环境设置 ----------------
 --map_size 14.0            
---num_cyl 19                
+--num_cyl 20                
 --num_balls 11               
---num_vox 9                 
+--num_vox 8                 
 --robot_radius 0.24         
 --cyl_radius_min 0.15       
 --cyl_radius_max 0.45       
+--cyl_height_min 0.5       # 圆柱从地面起的最小高度 (m)
+--cyl_height_max 1.5       # 圆柱从地面起的最大高度 (m)
 --ball_radius_min 0.15      
 --ball_radius_max 0.45      
 --ball_radius_floor 0.25    
@@ -127,7 +130,7 @@
 --env_height 48         
 --diff_nearest_pt true      # 是否用 CUDA 解析梯度求最近障碍物点（train_mpc 实际未使用）
 --randomize_start_goal true # 每个 rollout 在四个角中随机选择起点，终点取对角点
---protected_zone_radius 0.6 # 起点/终点周围禁止障碍物表面进入的半径 (m)
+--protected_zone_radius 1.0 # 起点/终点周围禁止障碍物表面进入的半径 (m)
 
 # ---------------- 障碍布局 ----------------
 # 分层（stratified）快速采样：候选来自抖动网格单元，覆盖比独立均匀采样

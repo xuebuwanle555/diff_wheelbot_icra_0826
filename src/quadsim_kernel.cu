@@ -94,19 +94,40 @@ __global__ void render_cuda_kernel(
         scalar_t cx = cylinders[batch_base][i][0];
         scalar_t cy = cylinders[batch_base][i][1];
         scalar_t r = cylinders[batch_base][i][2];
+        scalar_t h = cylinders[batch_base][i][3];
         scalar_t a = dx * dx + dy * dy;
         scalar_t b = 2 * (dx * (ox - cx) + dy * (oy - cy));
         scalar_t c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) - r * r;
         scalar_t d = b * b - 4 * a * c;
-        if (d >= 0) {
-            r = (-b-sqrt(d)) / (2 * a);
-            if (r > 1e-5) {
-                min_dist = min(min_dist, r);
-            } else {
-                r = (-b+sqrt(d)) / (2 * a);
-                if (r > 1e-5) min_dist = min(min_dist, r);
-            }
+        // Side wall: accept a quadratic root only when its hit point lies
+        // between the ground plane and this cylinder's sampled top.
+        if (a > 1e-12 && d >= 0) {
+            scalar_t sqrt_d = sqrt(d);
+            scalar_t t_side_1 = (-b - sqrt_d) / (2 * a);
+            scalar_t z_side_1 = oz + t_side_1 * dz;
+            if (t_side_1 > 1e-5 && z_side_1 >= 0 && z_side_1 <= h)
+                min_dist = min(min_dist, t_side_1);
+            scalar_t t_side_2 = (-b + sqrt_d) / (2 * a);
+            scalar_t z_side_2 = oz + t_side_2 * dz;
+            if (t_side_2 > 1e-5 && z_side_2 >= 0 && z_side_2 <= h)
+                min_dist = min(min_dist, t_side_2);
         }
+        // Closed circular caps at z=0 and z=h.
+        if (abs(dz) > 1e-12) {
+            scalar_t t_cap_bottom = -oz / dz;
+            scalar_t x_bottom = ox + t_cap_bottom * dx - cx;
+            scalar_t y_bottom = oy + t_cap_bottom * dy - cy;
+            if (t_cap_bottom > 1e-5 &&
+                    x_bottom * x_bottom + y_bottom * y_bottom <= r * r)
+                min_dist = min(min_dist, t_cap_bottom);
+
+            scalar_t t_cap_top = (h - oz) / dz;
+            scalar_t x_top = ox + t_cap_top * dx - cx;
+            scalar_t y_top = oy + t_cap_top * dy - cy;
+            if (t_cap_top > 1e-5 &&
+                    x_top * x_top + y_top * y_top <= r * r)
+                min_dist = min(min_dist, t_cap_top);
+            }
     }
     for (int i = 0; i < cylinders_h.size(1); i++) {
         scalar_t cx = cylinders_h[batch_base][i][0];

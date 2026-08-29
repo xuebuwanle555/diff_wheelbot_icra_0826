@@ -88,6 +88,7 @@ class Env:
                  map_size=20.0, num_cyl=25, num_balls=15, num_vox=15,
                  robot_radius=0.15,
                  cyl_radius_min=0.2, cyl_radius_max=0.5,
+                 cyl_height_min=0.5, cyl_height_max=1.5,
                  ball_radius_min=0.2, ball_radius_max=0.4,
                  ball_radius_floor=0.0,
                  start_pos=(-4.0, -4.0), target_pos=(4.0, 4.0),
@@ -130,7 +131,10 @@ class Env:
         self.scaffold = scaffold
         self.diff_nearest_pt = diff_nearest_pt
         
-        self.cyl = torch.zeros((self.batch_size, 0, 3), device=self.device)
+        # Vertical cylinders use (x, y, radius, height).  Their bases are at
+        # z=0; the CUDA renderer clips both the side wall and end caps to the
+        # sampled finite height.
+        self.cyl = torch.zeros((self.batch_size, 0, 4), device=self.device)
         self.cyl_h = torch.zeros((self.batch_size, 0, 3), device=self.device)
         self.balls = torch.zeros((self.batch_size, 0, 4), device=self.device) 
         self.voxels = torch.zeros((self.batch_size, 0, 6), device=self.device) 
@@ -160,6 +164,8 @@ class Env:
         self.num_vox = int(num_vox)
         self.cyl_radius_min = float(cyl_radius_min)
         self.cyl_radius_max = float(cyl_radius_max)
+        self.cyl_height_min = float(cyl_height_min)
+        self.cyl_height_max = float(cyl_height_max)
         self.ball_radius_min = float(ball_radius_min)
         self.ball_radius_max = float(ball_radius_max)
         self.ball_radius_floor = float(ball_radius_floor)
@@ -228,6 +234,8 @@ class Env:
             raise ValueError('obstacle counts must be non-negative')
         if not 0.0 < self.cyl_radius_min <= self.cyl_radius_max:
             raise ValueError('invalid cylinder radius range')
+        if not 0.0 < self.cyl_height_min <= self.cyl_height_max:
+            raise ValueError('invalid cylinder height range')
         if not 0.0 < self.ball_radius_min <= self.ball_radius_max:
             raise ValueError('invalid ball radius range')
         if not 0.0 <= self.ball_radius_floor <= self.ball_radius_max:
@@ -262,7 +270,7 @@ class Env:
 
     def randomize_obstacles(self):
         if self.single:
-            self.cyl = torch.zeros((self.batch_size, 0, 6), device=self.device)
+            self.cyl = torch.zeros((self.batch_size, 0, 4), device=self.device)
             self.balls = torch.zeros((self.batch_size, 0, 8), device=self.device)
             self.voxels = torch.zeros((self.batch_size, 0, 12), device=self.device)
             if self.has_dynamic_obstacles:
@@ -275,6 +283,9 @@ class Env:
         cyl_r = torch.rand(
             (self.batch_size, n_cyl, 1), device=self.device
         ) * (self.cyl_radius_max - self.cyl_radius_min) + self.cyl_radius_min
+        cyl_height = torch.rand(
+            (self.batch_size, n_cyl, 1), device=self.device
+        ) * (self.cyl_height_max - self.cyl_height_min) + self.cyl_height_min
         n_balls = self.num_balls
         ball_r = torch.rand(
             (self.batch_size, n_balls, 1), device=self.device
@@ -452,7 +463,7 @@ class Env:
         ball_xy = all_xy[:, n_cyl:n_cyl + n_balls]
         vox_xy = all_xy[:, n_cyl + n_balls:]
 
-        self.cyl = torch.cat([cyl_xy, cyl_r], dim=-1)
+        self.cyl = torch.cat([cyl_xy, cyl_r, cyl_height], dim=-1)
         # Ball centre height varies per instance, sampled uniformly from
         # half-buried (centre at z = 0) to floating 0.2 m above the ground
         # (centre at z = r + 0.2). This diversifies the rendered depth
@@ -567,7 +578,8 @@ class Env:
                 self.cyl_velocity, half_extent, radius)
             position, self.cyl_velocity = self._reflect_from_protected_zones(
                 position, self.cyl_velocity, radius)
-            self.cyl = torch.cat([position, radius], dim=-1).detach()
+            height = self.cyl[..., 3:4]
+            self.cyl = torch.cat([position, radius, height], dim=-1).detach()
         if self.balls.shape[1] > 0:
             radius = self.balls[..., 3:4]
             position, self.ball_velocity = self._reflect_planar(

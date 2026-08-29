@@ -107,6 +107,10 @@ def parse_args():
     parser.add_argument('--log_interval', type=int, default=25)
     parser.add_argument('--plot_interval', type=int, default=1000)
     parser.add_argument('--resume', default=None)
+    parser.add_argument(
+        '--init_checkpoint', default=None,
+        help='Load model weights into a new run without restoring the old '
+             'optimizer, scheduler, iteration, or output directory.')
 
     # --- loss weights (aligned with train.py) ---
     parser.add_argument('--coef_pos', type=float, default=1.0)
@@ -117,6 +121,9 @@ def parse_args():
     parser.add_argument('--coef_smooth', type=float, default=0.1)
     parser.add_argument('--coef_bias', type=float, default=0.5)
     parser.add_argument('--coef_goal_stop', type=float, default=0.5)
+    parser.add_argument('--coef_speed_head', type=float, default=0.4,
+                        help='Direct supervision weight for the policy speed '
+                             'head, independent of contact dynamics')
     parser.add_argument('--coef_energy', type=float, default=0.05)
     parser.add_argument('--goal_state_max_distance', type=float, default=6.0,
                         help='Clamp/scale radius for goal coordinates in the '
@@ -198,6 +205,8 @@ def parse_args():
     parser.add_argument('--robot_radius', type=float, default=0.15)
     parser.add_argument('--cyl_radius_min', type=float, default=0.2)
     parser.add_argument('--cyl_radius_max', type=float, default=0.5)
+    parser.add_argument('--cyl_height_min', type=float, default=0.5)
+    parser.add_argument('--cyl_height_max', type=float, default=1.5)
     parser.add_argument('--ball_radius_min', type=float, default=0.2)
     parser.add_argument('--ball_radius_max', type=float, default=0.4)
     parser.add_argument('--ball_radius_floor', type=float, default=0.0)
@@ -251,6 +260,8 @@ def parse_args():
         parser.error('--robot_radius must be positive')
     if not 0.0 < args.cyl_radius_min <= args.cyl_radius_max:
         parser.error('invalid cylinder radius range')
+    if not 0.0 < args.cyl_height_min <= args.cyl_height_max:
+        parser.error('invalid cylinder height range')
     if not 0.0 < args.ball_radius_min <= args.ball_radius_max:
         parser.error('invalid ball radius range')
     if not 0.0 <= args.ball_radius_floor <= args.ball_radius_max:
@@ -278,9 +289,12 @@ def parse_args():
     if not 0.0 <= args.goal_stop_crawl_speed < args.max_speed:
         parser.error(
             '--goal_stop_crawl_speed must be in [0, max_speed)')
-    if args.coef_goal_stop < 0.0 or args.backward_loss_gain < 0.0:
+    if (args.coef_goal_stop < 0.0
+            or args.coef_speed_head < 0.0
+            or args.backward_loss_gain < 0.0):
         parser.error(
-            '--coef_goal_stop and --backward_loss_gain must be non-negative')
+            '--coef_goal_stop, --coef_speed_head and '
+            '--backward_loss_gain must be non-negative')
     if not 0.0 <= args.min_desired_speed < args.initial_desired_speed:
         parser.error(
             '--min_desired_speed must be non-negative and below '
@@ -305,6 +319,8 @@ def parse_args():
         parser.error('--dt_noise_std must be non-negative')
     if args.max_action_delay_steps < 0:
         parser.error('--max_action_delay_steps must be non-negative')
+    if args.resume and args.init_checkpoint:
+        parser.error('--resume and --init_checkpoint are mutually exclusive')
     if args.run_name is not None and (
             os.path.basename(args.run_name) != args.run_name
             or args.run_name in ('.', '..')):
@@ -524,6 +540,7 @@ def rollout(
     # iterations that will actually emit a TensorBoard trajectory figure.
     waypoint_global_hist = [] if record_visualization else None
     mpc_traj_global_hist = [] if record_visualization else None
+    desired_speed_hist = []
 
     # Perceived obstacle state, refreshed at every control step.
     prev_points, prev_valid, prev_clearance = None, None, None
@@ -654,6 +671,7 @@ def rollout(
 
         # ---- waypoint policy --> MPC --> (v, omega) ----------------------
         waypoints, desired_speed, h = model(depth_input, state, h)
+        desired_speed_hist.append(desired_speed)
         command, trajectory = mpc(
             waypoints,
             desired_speed,
@@ -740,6 +758,7 @@ def rollout(
         'theta': torch.stack(theta_hist),
         'v': torch.stack(v_hist),
         'act': torch.stack(act_hist),
+        'desired_speed': torch.stack(desired_speed_hist),
         'surface_clearance': surface_clearance,
         'ctl_dt': torch.as_tensor(
             ctl_dts, device=device, dtype=env.p.dtype),
@@ -757,6 +776,7 @@ def compute_losses(args, env, hist):
     theta_stack = hist['theta']    # (T, B, 3)
     v_stack = hist['v']            # (T, B, 1)
     act_stack = hist['act']        # (T, B, 2)  MPC commands (v, omega)
+    desired_speed_stack = hist['desired_speed']  # (T, B, 1), policy output
     surface_clearance = hist['surface_clearance']  # (T, B), signed
 
     # The rollout horizon is dynamic, so broadcast the target against the
@@ -835,6 +855,13 @@ def compute_losses(args, env, hist):
         loss_velocity_scalar = F.smooth_l1_loss(
             v_stack.mean(dim=0), target_speed_scalar.mean(dim=0))
 
+    # Directly supervise the speed head as well as the executed velocity.
+    # Contact dynamics can make actual velocity insensitive to the requested
+    # speed, so Loss/Velocity alone cannot reliably prevent a far-from-goal
+    # speed-head collapse. The target is state-dependent, not timestep-based.
+    loss_speed_head = F.smooth_l1_loss(
+        desired_speed_stack, target_speed_scalar)
+
     # 4. Avoidance loss. The finite-difference approach speed only changes
     # the importance of a frame; detaching it guarantees that the spatial
     # gradient comes exclusively from signed clearance and points outward.
@@ -885,9 +912,15 @@ def compute_losses(args, env, hist):
         / args.near_goal_stop_temperature
     ).detach()
     over_crawl = F.relu(v_stack[..., 0] - args.goal_stop_crawl_speed)
-    loss_goal_stop = (
+    near_goal_seen = (
+        dist_all_steps <= args.near_goal_stop_radius
+    ).any(dim=0).to(v_stack.dtype).detach()
+    stop_loss_per_episode = (
         near_goal_weight * over_crawl.pow(2)
-    ).sum() / near_goal_weight.sum().clamp_min(1e-6)
+    ).sum(dim=0) / near_goal_weight.sum(dim=0).clamp_min(1e-6)
+    loss_goal_stop = (
+        stop_loss_per_episode * near_goal_seen
+    ).sum() / near_goal_seen.sum().clamp_min(1.0)
 
     # 9. Energy loss
     loss_action_energy = act_stack.pow(2).mean()
@@ -913,6 +946,7 @@ def compute_losses(args, env, hist):
         + args.coef_smooth * loss_smooth \
         + args.coef_bias * loss_bias \
         + args.coef_goal_stop * loss_goal_stop \
+        + args.coef_speed_head * loss_speed_head \
         + args.coef_energy * loss_action_energy
 
     parts = {
@@ -925,6 +959,7 @@ def compute_losses(args, env, hist):
         'Loss/Smooth': loss_smooth,
         'Loss/Bias': loss_bias,
         'Loss/GoalStop': loss_goal_stop,
+        'Loss/SpeedHead': loss_speed_head,
         'Loss/Energy': loss_action_energy,
         'Metric/FinalDist': dist_all_steps[-1].mean(),
         'Metric/MeanSpeed': v_stack.mean(),
@@ -966,11 +1001,15 @@ def main():
 
     device = torch.device('cuda')
     ckpt = None
+    init_ckpt = None
     start_iter = 0
     if args.resume:
         print(f"Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
         start_iter = ckpt.get('iter', 0)
+    elif args.init_checkpoint:
+        print(f"Loading model weights: {args.init_checkpoint}")
+        init_ckpt = torch.load(args.init_checkpoint, map_location=device)
 
     configure_run_directories(args, checkpoint=ckpt)
     os.makedirs(args.save_dir, exist_ok=ckpt is not None)
@@ -994,6 +1033,8 @@ def main():
               robot_radius=args.robot_radius,
               cyl_radius_min=args.cyl_radius_min,
               cyl_radius_max=args.cyl_radius_max,
+              cyl_height_min=args.cyl_height_min,
+              cyl_height_max=args.cyl_height_max,
               ball_radius_min=args.ball_radius_min,
               ball_radius_max=args.ball_radius_max,
               ball_radius_floor=args.ball_radius_floor,
@@ -1026,6 +1067,10 @@ def main():
         if 'sched' in ckpt:
             sched.load_state_dict(ckpt['sched'])
         print(f"Resumed from iteration {start_iter}")
+    elif init_ckpt is not None:
+        state_dict = init_ckpt.get('model', init_ckpt)
+        model.load_state_dict(state_dict)
+        print('Initialized model weights; optimizer and scheduler are new')
 
     metric_names = (
         'Loss/Total',
@@ -1037,6 +1082,7 @@ def main():
         'Loss/Smooth',
         'Loss/Bias',
         'Loss/GoalStop',
+        'Loss/SpeedHead',
         'Loss/Energy',
         'Metric/FinalDist',
         'Metric/MeanSpeed',
