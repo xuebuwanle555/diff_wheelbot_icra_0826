@@ -1,10 +1,24 @@
 # =========================================================================
-# 混合 20/11/8、24/13/9、27/15/10
+# Diff-Wheelbot：X-NavDP cluttered_easy 目标保持门控消融
+#
+# 14x14 地图 + 分层（stratified）障碍布局，面向窄通道通行能力。
+# 刻意不包含 --resume，每次启动都是全新训练。
+# 障碍密度使用保留低密度经验的混合课程：先固定 20/11/8，随后按概率
+# 混合 20/11/8、24/13/9、27/15/10；不再使用导致后期退化的 30/17/11。
+#
 # 防速度坍缩：启用随机 rollout 时域（randomize_horizon）并将速度损失改为
 # 滑动窗口均值形式，避免 GRU 把步数当作进度线索，导致部署超过训练时域后
 # desired_speed 塌缩到 min_desired_speed。
 #
-# python3 train_mpc.py @configs/xnavdp_dense_corridor_v2.args
+# 本配置以 density_mixed_v1 为严格对照，仅修改 AVOID/RECOVER 门控：
+#   1) AVOID 目标对齐权重 0.20 -> 0.50；
+#   2) 最小避障平移 0.40 m -> 0.15 m；
+#   3) 连续畅通判定 8 -> 4 帧；
+#   4) 恢复目标权重 12 -> 8 帧。
+# 障碍密度、损失权重和 grad_decay=0.8 均保持不变，避免混淆消融结论。
+#
+# 用法：python3 train_mpc.py @configs/xnavdp_dense_corridor_gate_retention_v1.args
+# 命令行中出现在 @file 之后的参数会覆盖本文件中的取值。
 # =========================================================================
 
 # ---------------- 基础训练设置 ----------------
@@ -15,9 +29,9 @@
 # episode 的步数在 [min_timesteps, max_timesteps] 内均匀采样。
 --timesteps 120             # 固定 rollout 步长（关闭随机化时使用）
 --randomize_horizon true    # 逐 episode 随机采样 rollout 步长
---min_timesteps 135
---max_timesteps 165
---grad_decay 1.0            
+--min_timesteps 135          # 随机时域下界
+--max_timesteps 165         # 随机时域上界
+--grad_decay 0.8            
 --fov_x_half_tan 0.82       
 --control_hz 15.0           
 --dt_noise_std 0.005        
@@ -32,6 +46,7 @@
 # ---------------- checkpoint / 日志 ----------------
 --save_dir save/xnavdp_dense_corridor_v2  
 --log_dir runs/xnavdp_dense_corridor_v2
+--run_name gate_retention_v1
 --ckpt_interval 3000        
 --log_interval 25           
 --plot_interval 500         
@@ -48,7 +63,7 @@
 --coef_goal_stop 0.3        # 近目标残余速度约束（原 0.5 过强易提前停死）
 --coef_speed_head 0.15      # 保留速度头直接监督，但避免压过导航/避障目标
 --coef_energy 0.05          
---goal_state_max_distance 10.0 
+--goal_state_max_distance 10.0  # 策略状态向量中目标坐标的截断/缩放半径，必须与部署端 --goal_state_max_distance 一致（20260829 起 G=6→10，目标 12.7m 对角开局仍会截断到 10）
 --goal_loss_radius 0.25     # 训练收敛半径，小于评测成功半径以保留裕量
 --success_radius 0.50       # 成功率仍按进入 0.5 m 判定
 --near_goal_stop_radius 0.60       # 从该距离开始平滑加强停车约束（原 0.8，
@@ -108,9 +123,9 @@
 --emergency_ttc 1.0             # 更早根据接近速度触发制动
 
 # ---------------- 前方畅通条件门控 ----------------
-# ALIGN 使用较窄、较短的进入通道，避免过早转向；AVOID 仍保留 20% 目标
-# 吸引力，并且至少前进 0.4 m；随后使用更宽的侧前方通道判定是否已经绕过
-# 障碍；进入 RECOVER 后用 12 帧平滑恢复目标吸引力，避免突然反打方向。
+# ALIGN 使用与基线相同的进入通道；AVOID 保留 50% 目标吸引力，防止车体
+# 绕障时转到目标背面。平移 0.15 m 后即可参与退出判定，并缩短清空确认和
+# RECOVER 时长，减少低速状态下长期锁在 AVOID 的概率。
 --front_clearance_gating true
 --front_corridor_half_width 0.26 # 进入检测：0.24 m 机体半径 + 0.02 m 裕量
 --front_trigger_base 0.20
@@ -118,12 +133,12 @@
 --front_trigger_brake_decel 3.0  # v=1/1.5/2 时约 0.52/0.80/1.17 m
 --front_trigger_min 0.45
 --front_trigger_max 1.20
---front_avoid_align_scale 0.20   # 避障时仍保留 20% heading/waypoint 目标约束
+--front_avoid_align_scale 0.50   # 避障时保留 50% heading/waypoint 目标约束
 --front_release_half_width 0.45  # 退出检测覆盖更宽的侧前方扫掠区域
 --front_release_margin 0.25
---front_min_avoid_progress 0.40  # 至少真实平移 0.4 m 后才允许退出 AVOID
---front_release_clear_steps 8    # 15 Hz 下约 0.53 s 连续畅通
---front_recovery_steps 12        # 约 0.8 s 内将目标权重从 0.2 渐变到 1.0
+--front_min_avoid_progress 0.15  # 至少真实平移 0.15 m 后允许退出 AVOID
+--front_release_clear_steps 4    # 15 Hz 下约 0.27 s 连续畅通
+--front_recovery_steps 8         # 约 0.53 s 内将目标权重从 0.5 渐变到 1.0
 
 # ---------------- 环境设置 ----------------
 --map_size 14.0            

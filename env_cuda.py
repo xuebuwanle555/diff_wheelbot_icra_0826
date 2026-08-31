@@ -262,6 +262,13 @@ class Env:
             self.dynamic_generator.manual_seed(
                 int(dynamic_obstacle_seed) % (2 ** 63 - 1))
 
+    def set_obstacle_counts(self, num_cyl, num_balls, num_vox):
+        """Set the obstacle counts used by the next environment reset."""
+        counts = (int(num_cyl), int(num_balls), int(num_vox))
+        if min(counts) < 0:
+            raise ValueError('obstacle counts must be non-negative')
+        self.num_cyl, self.num_balls, self.num_vox = counts
+
     def sample_start_and_target(self):
         """Pick one of four map corners and its opposite corner per episode."""
         choice = torch.randint(

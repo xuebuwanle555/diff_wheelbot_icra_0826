@@ -116,6 +116,9 @@ def parse_args():
     parser.add_argument('--coef_pos', type=float, default=1.0)
     parser.add_argument('--coef_v', type=float, default=1.0)
     parser.add_argument('--coef_heading', type=float, default=0.5)
+    parser.add_argument('--coef_waypoint_align', type=float, default=0.15,
+                        help='Align the first waypoint with the local goal '
+                             'only while the forward swept corridor is clear')
     parser.add_argument('--coef_obj_avoidance', type=float, default=1.0)
     parser.add_argument('--coef_collide', type=float, default=3.5)
     parser.add_argument('--coef_smooth', type=float, default=0.1)
@@ -193,6 +196,37 @@ def parse_args():
     parser.add_argument('--obstacle_max_range', type=float, default=6.0)
     parser.add_argument('--emergency_distance', type=float, default=1.5)
     parser.add_argument('--emergency_ttc', type=float, default=0.8)
+    parser.add_argument('--front_clearance_gating', type=str2bool, default=False,
+                        help='Disable goal-heading/waypoint alignment while a '
+                             'speed-dependent forward corridor is blocked')
+    parser.add_argument('--front_corridor_half_width', type=float, default=0.26,
+                        help='Half width of the local forward swept corridor')
+    parser.add_argument('--front_trigger_base', type=float, default=0.20,
+                        help='Base forward obstacle trigger distance in metres')
+    parser.add_argument('--front_trigger_reaction_time', type=float, default=0.15,
+                        help='Reaction-time term used by the speed-dependent '
+                             'forward obstacle trigger')
+    parser.add_argument('--front_trigger_brake_decel', type=float, default=3.0,
+                        help='Assumed braking deceleration for the forward '
+                             'obstacle trigger in m/s^2')
+    parser.add_argument('--front_trigger_min', type=float, default=0.45)
+    parser.add_argument('--front_trigger_max', type=float, default=1.20)
+    parser.add_argument('--front_avoid_align_scale', type=float, default=0.2,
+                        help='Residual goal-alignment weight during avoidance')
+    parser.add_argument('--front_release_half_width', type=float, default=0.45,
+                        help='Wider front/side corridor used only for release')
+    parser.add_argument('--front_release_margin', type=float, default=0.25,
+                        help='Extra clearance required before restoring goal '
+                             'alignment, preventing gate chatter')
+    parser.add_argument('--front_min_avoid_progress', type=float, default=0.4,
+                        help='Minimum translation after entering avoidance '
+                             'before recovery is allowed')
+    parser.add_argument('--front_release_clear_steps', type=int, default=8,
+                        help='Consecutive clear frames required to leave '
+                             'avoidance mode')
+    parser.add_argument('--front_recovery_steps', type=int, default=12,
+                        help='Frames used to ramp alignment from avoidance '
+                             'weight back to full strength')
 
     # --- environment ---
     parser.add_argument('--env_width', type=int, default=64)
@@ -202,6 +236,37 @@ def parse_args():
     parser.add_argument('--num_cyl', type=int, default=25)
     parser.add_argument('--num_balls', type=int, default=15)
     parser.add_argument('--num_vox', type=int, default=15)
+    parser.add_argument(
+        '--obstacle_curriculum', type=str2bool, default=False,
+        help='Enable obstacle-density curriculum training')
+    parser.add_argument(
+        '--obstacle_curriculum_mode', choices=('staged', 'mixed'),
+        default='staged',
+        help='Use monotonic stages or retain lower densities through a '
+             'deterministic per-iteration mixture')
+    parser.add_argument(
+        '--obstacle_curriculum_boundaries', type=int, nargs=3,
+        default=(3000, 6000, 9000), metavar=('I1', 'I2', 'I3'),
+        help='Iteration indices at which stages 2, 3 and 4 begin')
+    parser.add_argument(
+        '--obstacle_curriculum_num_cyl', type=int, nargs=4,
+        default=(20, 24, 27, 30), metavar=('N1', 'N2', 'N3', 'N4'))
+    parser.add_argument(
+        '--obstacle_curriculum_num_balls', type=int, nargs=4,
+        default=(11, 13, 15, 17), metavar=('N1', 'N2', 'N3', 'N4'))
+    parser.add_argument(
+        '--obstacle_curriculum_num_vox', type=int, nargs=4,
+        default=(8, 9, 10, 11), metavar=('N1', 'N2', 'N3', 'N4'))
+    parser.add_argument(
+        '--obstacle_curriculum_mix_boundaries', type=int, nargs=2,
+        default=(3000, 9000), metavar=('I1', 'I2'),
+        help='Iteration indices at which mixed phases 2 and 3 begin')
+    parser.add_argument(
+        '--obstacle_curriculum_phase2_probs', type=float, nargs=3,
+        default=(0.7, 0.3, 0.0), metavar=('LOW', 'MID', 'HIGH'))
+    parser.add_argument(
+        '--obstacle_curriculum_phase3_probs', type=float, nargs=3,
+        default=(0.5, 0.4, 0.1), metavar=('LOW', 'MID', 'HIGH'))
     parser.add_argument('--robot_radius', type=float, default=0.15)
     parser.add_argument('--cyl_radius_min', type=float, default=0.2)
     parser.add_argument('--cyl_radius_max', type=float, default=0.5)
@@ -256,6 +321,50 @@ def parse_args():
         parser.error('--map_size must be positive')
     if min(args.num_cyl, args.num_balls, args.num_vox) < 0:
         parser.error('obstacle counts must be non-negative')
+    curriculum_counts = (
+        args.obstacle_curriculum_num_cyl,
+        args.obstacle_curriculum_num_balls,
+        args.obstacle_curriculum_num_vox,
+    )
+    if any(min(counts) < 0 for counts in curriculum_counts):
+        parser.error('obstacle curriculum counts must be non-negative')
+    if any(
+            later < earlier
+            for counts in curriculum_counts
+            for earlier, later in zip(counts, counts[1:])):
+        parser.error('obstacle curriculum counts must be non-decreasing')
+    boundaries = args.obstacle_curriculum_boundaries
+    if any(boundary <= 0 for boundary in boundaries) or any(
+            later <= earlier
+            for earlier, later in zip(boundaries, boundaries[1:])):
+        parser.error(
+            '--obstacle_curriculum_boundaries must be positive and strictly '
+            'increasing')
+    if (args.obstacle_curriculum
+            and args.obstacle_curriculum_mode == 'staged'
+            and boundaries[-1] >= args.num_iters):
+        parser.error(
+            'the final obstacle curriculum stage must begin before num_iters')
+    mix_boundaries = args.obstacle_curriculum_mix_boundaries
+    if (mix_boundaries[0] <= 0
+            or mix_boundaries[1] <= mix_boundaries[0]):
+        parser.error(
+            '--obstacle_curriculum_mix_boundaries must be positive and '
+            'strictly increasing')
+    if (args.obstacle_curriculum
+            and args.obstacle_curriculum_mode == 'mixed'
+            and mix_boundaries[-1] >= args.num_iters):
+        parser.error(
+            'the final mixed curriculum phase must begin before num_iters')
+    for name, probabilities in (
+            ('--obstacle_curriculum_phase2_probs',
+             args.obstacle_curriculum_phase2_probs),
+            ('--obstacle_curriculum_phase3_probs',
+             args.obstacle_curriculum_phase3_probs)):
+        if any(probability < 0.0 for probability in probabilities):
+            parser.error(f'{name} values must be non-negative')
+        if abs(sum(probabilities) - 1.0) > 1e-6:
+            parser.error(f'{name} values must sum to 1')
     if args.robot_radius <= 0.0:
         parser.error('--robot_radius must be positive')
     if not 0.0 < args.cyl_radius_min <= args.cyl_radius_max:
@@ -291,9 +400,10 @@ def parse_args():
             '--goal_stop_crawl_speed must be in [0, max_speed)')
     if (args.coef_goal_stop < 0.0
             or args.coef_speed_head < 0.0
+            or args.coef_waypoint_align < 0.0
             or args.backward_loss_gain < 0.0):
         parser.error(
-            '--coef_goal_stop, --coef_speed_head and '
+            '--coef_goal_stop, --coef_speed_head, --coef_waypoint_align and '
             '--backward_loss_gain must be non-negative')
     if not 0.0 <= args.min_desired_speed < args.initial_desired_speed:
         parser.error(
@@ -319,6 +429,29 @@ def parse_args():
         parser.error('--dt_noise_std must be non-negative')
     if args.max_action_delay_steps < 0:
         parser.error('--max_action_delay_steps must be non-negative')
+    if args.front_corridor_half_width <= 0.0:
+        parser.error('--front_corridor_half_width must be positive')
+    if args.front_release_half_width < args.front_corridor_half_width:
+        parser.error('--front_release_half_width must be at least as large as '
+                     '--front_corridor_half_width')
+    if (args.front_trigger_base < 0.0
+            or args.front_trigger_reaction_time < 0.0
+            or args.front_trigger_brake_decel <= 0.0):
+        parser.error('invalid speed-dependent front-trigger parameters')
+    if (args.front_trigger_min <= 0.0
+            or args.front_trigger_max < args.front_trigger_min):
+        parser.error('--front_trigger_max must be >= positive '
+                     '--front_trigger_min')
+    if args.front_release_margin < 0.0:
+        parser.error('--front_release_margin must be non-negative')
+    if not 0.0 <= args.front_avoid_align_scale <= 1.0:
+        parser.error('--front_avoid_align_scale must be in [0, 1]')
+    if args.front_min_avoid_progress < 0.0:
+        parser.error('--front_min_avoid_progress must be non-negative')
+    if args.front_release_clear_steps < 1:
+        parser.error('--front_release_clear_steps must be positive')
+    if args.front_recovery_steps < 1:
+        parser.error('--front_recovery_steps must be positive')
     if args.resume and args.init_checkpoint:
         parser.error('--resume and --init_checkpoint are mutually exclusive')
     if args.run_name is not None and (
@@ -330,6 +463,66 @@ def parse_args():
             parser.error('--min_timesteps must be positive and '
                          '<= --max_timesteps')
     return args
+
+
+def _curriculum_uniform(seed, iteration):
+    """Stateless SplitMix64 sample in [0, 1), stable across resume."""
+    mask = (1 << 64) - 1
+    value = (
+        int(iteration)
+        + 0x9E3779B97F4A7C15
+        + int(seed) * 0xD1B54A32D192ED03
+    ) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    value ^= value >> 31
+    return ((value >> 11) & ((1 << 53) - 1)) / float(1 << 53)
+
+
+def obstacle_curriculum_probabilities(args, phase):
+    """Return low/medium/high mixture probabilities for a mixed phase."""
+    if phase == 0:
+        return (1.0, 0.0, 0.0)
+    if phase == 1:
+        return tuple(args.obstacle_curriculum_phase2_probs)
+    return tuple(args.obstacle_curriculum_phase3_probs)
+
+
+def obstacle_curriculum_state(args, iteration):
+    """Return ``(phase, density_level, counts)`` for the next rollout.
+
+    Mixed-mode sampling is a pure function of seed and zero-based iteration,
+    so a checkpoint resume reproduces the same future density sequence without
+    storing additional random-number-generator state.
+    """
+    if not args.obstacle_curriculum:
+        return 0, 0, (args.num_cyl, args.num_balls, args.num_vox)
+
+    if args.obstacle_curriculum_mode == 'staged':
+        stage = sum(
+            iteration >= boundary
+            for boundary in args.obstacle_curriculum_boundaries
+        )
+        density_level = stage
+        phase = stage
+    else:
+        phase = sum(
+            iteration >= boundary
+            for boundary in args.obstacle_curriculum_mix_boundaries
+        )
+        probabilities = obstacle_curriculum_probabilities(args, phase)
+        sample = _curriculum_uniform(args.seed, iteration)
+        density_level = 0
+        cumulative = probabilities[0]
+        while density_level < 2 and sample >= cumulative:
+            density_level += 1
+            cumulative += probabilities[density_level]
+
+    return phase, density_level, (
+        args.obstacle_curriculum_num_cyl[density_level],
+        args.obstacle_curriculum_num_balls[density_level],
+        args.obstacle_curriculum_num_vox[density_level],
+    )
 
 
 def configure_run_directories(args, checkpoint=None, timestamp=None):
@@ -541,9 +734,18 @@ def rollout(
     waypoint_global_hist = [] if record_visualization else None
     mpc_traj_global_hist = [] if record_visualization else None
     desired_speed_hist = []
+    waypoint_align_error_hist = []
+    goal_align_weight_hist = []
+    front_gate_active_hist = []
 
     # Perceived obstacle state, refreshed at every control step.
     prev_points, prev_valid, prev_clearance = None, None, None
+    # Per-environment three-stage state machine: ALIGN (0), AVOID (1), and
+    # RECOVER (2).  All gate state remains detached and on the GPU.
+    front_gate_phase = torch.zeros(B, dtype=torch.int8, device=device)
+    front_clear_count = torch.zeros(B, dtype=torch.int32, device=device)
+    front_recovery_step = torch.zeros(B, dtype=torch.int32, device=device)
+    front_avoid_start_xy = torch.zeros((B, 2), device=device)
 
     response_rate_k = torch.rand((B, 2), device=device) \
         * (args.motor_rate_max - args.motor_rate_min) + args.motor_rate_min
@@ -610,10 +812,10 @@ def rollout(
         noise = torch.randn_like(depth_inv) * 0.02
         depth_input = F.max_pool2d(depth_inv + noise, 2, 2)
 
-        # Perceived obstacle inputs only matter when the MPC actually uses
-        # them (perception-safety refinement); skip the extraction entirely
-        # otherwise to save the per-step perception kernels.
-        if args.mpc_perception_safety:
+        # Extract the same local obstacle points for either safety MPC or the
+        # lightweight goal-alignment gate.  When both are enabled, the work is
+        # shared.  With both disabled the extraction remains fully skipped.
+        if args.mpc_perception_safety or args.front_clearance_gating:
             obstacle_points, obstacle_valid = depth_to_local_obstacle_points(
                 depth,
                 fov_x_half_tan=args.fov_x_half_tan,
@@ -623,6 +825,10 @@ def rollout(
                 min_range=args.obstacle_min_range,
                 max_range=args.obstacle_max_range,
             )
+        else:
+            obstacle_points = obstacle_valid = None
+
+        if args.mpc_perception_safety:
             obstacle_velocity = estimate_local_obstacle_velocity(
                 obstacle_points, obstacle_valid,
                 prev_points, prev_valid,
@@ -637,8 +843,138 @@ def rollout(
             prev_points, prev_valid, prev_clearance = \
                 obstacle_points, obstacle_valid, clearance
         else:
-            obstacle_points = obstacle_valid = obstacle_velocity = None
+            obstacle_velocity = None
             emergency_risk = None
+
+        # Three-stage goal-alignment gate:
+        #   ALIGN   -- use a narrow, shorter trigger so turning starts later;
+        #   AVOID   -- retain a residual goal pull and require real progress;
+        #   RECOVER -- restore alignment gradually instead of snapping back.
+        # Release uses a wider corridor than entry so an obstacle that has
+        # moved toward the side of the camera cannot trigger an early turn-back.
+        if args.front_clearance_gating:
+            in_entry_corridor = (
+                obstacle_valid
+                & (obstacle_points[..., 0] > 0.0)
+                & (obstacle_points[..., 1].abs()
+                   <= args.front_corridor_half_width)
+            )
+            no_obstacle = torch.full_like(
+                obstacle_points[..., 0], float('inf'))
+            entry_distance = torch.where(
+                in_entry_corridor,
+                obstacle_points[..., 0],
+                no_obstacle,
+            ).amin(dim=1)
+            in_release_corridor = (
+                obstacle_valid
+                & (obstacle_points[..., 0] > 0.0)
+                & (obstacle_points[..., 1].abs()
+                   <= args.front_release_half_width)
+            )
+            release_distance = torch.where(
+                in_release_corridor,
+                obstacle_points[..., 0],
+                no_obstacle,
+            ).amin(dim=1)
+            forward_speed = v_obs.detach().clamp_min(0.0)
+            front_trigger = (
+                args.front_trigger_base
+                + forward_speed * args.front_trigger_reaction_time
+                + forward_speed.square()
+                / (2.0 * args.front_trigger_brake_decel)
+            ).clamp(args.front_trigger_min, args.front_trigger_max)
+            blocked_now = entry_distance < front_trigger
+            release_clear = (
+                release_distance
+                > front_trigger + args.front_release_margin
+            )
+
+            phase_before = front_gate_phase
+            entering_alignment = (phase_before == 0) & blocked_now
+            # Recovery is cancelled by any obstacle returning to the wider
+            # release corridor, even if it is no longer in the narrow entry
+            # corridor.  This prevents goal attraction from ramping up while
+            # the bypassed obstacle is still alongside the body.
+            recovery_reblocked = (phase_before == 2) & ~release_clear
+            entering_or_reblocked = (
+                entering_alignment | recovery_reblocked
+            )
+            front_avoid_start_xy = torch.where(
+                entering_or_reblocked[:, None],
+                xy_obs.detach(),
+                front_avoid_start_xy,
+            )
+            avoid_progress = torch.norm(
+                xy_obs.detach() - front_avoid_start_xy, dim=-1)
+            release_candidate = (
+                (phase_before == 1)
+                & release_clear
+                & (avoid_progress >= args.front_min_avoid_progress)
+            )
+            front_clear_count = torch.where(
+                release_candidate,
+                front_clear_count + 1,
+                torch.zeros_like(front_clear_count),
+            )
+            enter_recovery = (
+                (phase_before == 1)
+                & (front_clear_count >= args.front_release_clear_steps)
+            )
+            front_gate_phase = torch.where(
+                entering_or_reblocked,
+                torch.ones_like(front_gate_phase),
+                front_gate_phase,
+            )
+            front_gate_phase = torch.where(
+                enter_recovery,
+                torch.full_like(front_gate_phase, 2),
+                front_gate_phase,
+            )
+
+            recovering = (phase_before == 2) & release_clear
+            front_recovery_step = torch.where(
+                recovering,
+                front_recovery_step + 1,
+                torch.zeros_like(front_recovery_step),
+            )
+            recovery_complete = (
+                recovering
+                & (front_recovery_step >= args.front_recovery_steps)
+            )
+            front_gate_phase = torch.where(
+                recovery_complete,
+                torch.zeros_like(front_gate_phase),
+                front_gate_phase,
+            )
+
+            recovery_fraction = (
+                front_recovery_step.to(depth.dtype)
+                / args.front_recovery_steps
+            ).clamp(0.0, 1.0)
+            recovery_weight = (
+                args.front_avoid_align_scale
+                + (1.0 - args.front_avoid_align_scale)
+                * recovery_fraction
+            )
+            goal_align_weight = torch.where(
+                front_gate_phase == 0,
+                torch.ones_like(recovery_weight),
+                torch.where(
+                    front_gate_phase == 1,
+                    torch.full_like(
+                        recovery_weight, args.front_avoid_align_scale),
+                    recovery_weight,
+                ),
+            ).detach()
+            front_gate_active = (front_gate_phase != 0).to(depth.dtype)
+        else:
+            goal_align_weight = torch.ones(
+                B, device=device, dtype=depth.dtype)
+            front_gate_active = torch.zeros(
+                B, device=device, dtype=depth.dtype)
+        goal_align_weight_hist.append(goal_align_weight)
+        front_gate_active_hist.append(front_gate_active)
 
         # ---- goal state in the robot frame (same as train.py) ------------
         vec_global = env.p_target[:, :2] - xy_obs
@@ -672,6 +1008,12 @@ def rollout(
         # ---- waypoint policy --> MPC --> (v, omega) ----------------------
         waypoints, desired_speed, h = model(depth_input, state, h)
         desired_speed_hist.append(desired_speed)
+        local_goal_direction = torch.stack([local_x, local_y], dim=-1)
+        waypoint_align_error_hist.append(
+            1.0 - F.cosine_similarity(
+                waypoints[:, 0], local_goal_direction, dim=-1
+            )
+        )
         command, trajectory = mpc(
             waypoints,
             desired_speed,
@@ -759,6 +1101,9 @@ def rollout(
         'v': torch.stack(v_hist),
         'act': torch.stack(act_hist),
         'desired_speed': torch.stack(desired_speed_hist),
+        'waypoint_align_error': torch.stack(waypoint_align_error_hist),
+        'goal_align_weight': torch.stack(goal_align_weight_hist),
+        'front_gate_active': torch.stack(front_gate_active_hist),
         'surface_clearance': surface_clearance,
         'ctl_dt': torch.as_tensor(
             ctl_dts, device=device, dtype=env.p.dtype),
@@ -777,6 +1122,9 @@ def compute_losses(args, env, hist):
     v_stack = hist['v']            # (T, B, 1)
     act_stack = hist['act']        # (T, B, 2)  MPC commands (v, omega)
     desired_speed_stack = hist['desired_speed']  # (T, B, 1), policy output
+    waypoint_align_error = hist['waypoint_align_error']  # (T, B)
+    goal_align_weight = hist['goal_align_weight']         # (T, B), detached
+    front_gate_active = hist['front_gate_active']         # (T, B), detached
     surface_clearance = hist['surface_clearance']  # (T, B), signed
 
     # The rollout horizon is dynamic, so broadcast the target against the
@@ -796,12 +1144,19 @@ def compute_losses(args, env, hist):
     # 1. Pos loss
     loss_pos = F.relu(dist_all_steps - args.goal_loss_radius).mean()
 
-    # 2. Heading loss
-    mask_heading = (dist_all_steps > args.goal_loss_radius).float()
+    # 2. Goal-alignment losses.  In open space, align both the chassis and the
+    # first local waypoint with the target. During avoidance the detached
+    # three-stage gate retains a residual target pull, then ramps it back to
+    # full strength during recovery. Position, collision, clearance,
+    # smoothness and direction losses remain active throughout.
+    valid_heading = (dist_all_steps > args.goal_loss_radius).float()
+    mask_heading = valid_heading * goal_align_weight
     raw_heading_loss = 1.0 - F.cosine_similarity(
         cur_dir_all, dir_to_target_all, dim=-1)
     loss_heading = (raw_heading_loss * mask_heading).sum() \
-        / (mask_heading.sum() + 1e-5)
+        / (valid_heading.sum() + 1e-5)
+    loss_waypoint_align = (waypoint_align_error * mask_heading).sum() \
+        / (valid_heading.sum() + 1e-5)
 
     # 3. Velocity loss.  Tracking a per-step target trains the GRU to encode
     # the timestep itself as a braking cue (the desired speed then collapses
@@ -940,6 +1295,7 @@ def compute_losses(args, env, hist):
 
     total_loss = args.coef_pos * loss_pos \
         + args.coef_heading * loss_heading \
+        + args.coef_waypoint_align * loss_waypoint_align \
         + args.coef_v * loss_velocity_scalar \
         + args.coef_obj_avoidance * loss_avoid \
         + args.coef_collide * loss_collide \
@@ -953,6 +1309,7 @@ def compute_losses(args, env, hist):
         'Loss/Total': total_loss,
         'Loss/Pos': loss_pos,
         'Loss/Heading': loss_heading,
+        'Loss/WaypointAlign': loss_waypoint_align,
         'Loss/Velocity': loss_velocity_scalar,
         'Loss/Avoid': loss_avoid,
         'Loss/Collide': loss_collide,
@@ -965,6 +1322,8 @@ def compute_losses(args, env, hist):
         'Metric/MeanSpeed': v_stack.mean(),
         'Metric/SuccessRate': success_rate,
         'Metric/CollisionRate': collision_rate,
+        'Metric/AvoidModeRate': front_gate_active.mean(),
+        'Metric/MeanAlignWeight': goal_align_weight.mean(),
     }
     return total_loss, parts
 
@@ -1021,15 +1380,16 @@ def main():
     print(f"Checkpoint directory: {args.save_dir}")
     print(f"TensorBoard directory: {args.log_dir}")
 
+    _, _, initial_obstacle_counts = obstacle_curriculum_state(args, start_iter)
     env = Env(args.batch_size, args.env_width, args.env_height,
               args.grad_decay, device,
               fov_x_half_tan=args.fov_x_half_tan,
               ground_voxels=True,
               diff_nearest_pt=args.diff_nearest_pt,
               map_size=args.map_size,
-              num_cyl=args.num_cyl,
-              num_balls=args.num_balls,
-              num_vox=args.num_vox,
+              num_cyl=initial_obstacle_counts[0],
+              num_balls=initial_obstacle_counts[1],
+              num_vox=initial_obstacle_counts[2],
               robot_radius=args.robot_radius,
               cyl_radius_min=args.cyl_radius_min,
               cyl_radius_max=args.cyl_radius_max,
@@ -1076,6 +1436,7 @@ def main():
         'Loss/Total',
         'Loss/Pos',
         'Loss/Heading',
+        'Loss/WaypointAlign',
         'Loss/Velocity',
         'Loss/Avoid',
         'Loss/Collide',
@@ -1088,14 +1449,44 @@ def main():
         'Metric/MeanSpeed',
         'Metric/SuccessRate',
         'Metric/CollisionRate',
+        'Metric/AvoidModeRate',
+        'Metric/MeanAlignWeight',
     )
     scalar_sums = torch.zeros(len(metric_names), device=device)
     scalar_count = 0
 
     pbar = tqdm(range(start_iter, args.num_iters), ncols=100,
                 initial=start_iter, total=args.num_iters)
+    active_curriculum_phase = None
+    active_obstacle_counts = None
 
     for i in pbar:
+        curriculum_phase, density_level, obstacle_counts = \
+            obstacle_curriculum_state(args, i)
+        if obstacle_counts != active_obstacle_counts:
+            env.set_obstacle_counts(*obstacle_counts)
+            active_obstacle_counts = obstacle_counts
+        if curriculum_phase != active_curriculum_phase:
+            active_curriculum_phase = curriculum_phase
+            if (args.obstacle_curriculum
+                    and args.obstacle_curriculum_mode == 'mixed'):
+                probabilities = obstacle_curriculum_probabilities(
+                    args, curriculum_phase)
+                tqdm.write(
+                    'Obstacle curriculum mixed phase '
+                    f'{curriculum_phase + 1}/3 at iteration {i}: '
+                    f'low/mid/high={probabilities}, '
+                    f'first_density_level={density_level + 1}, '
+                    f'counts={obstacle_counts}'
+                )
+            else:
+                tqdm.write(
+                    'Obstacle curriculum stage '
+                    f'{curriculum_phase + 1}/'
+                    f'{4 if args.obstacle_curriculum else 1} '
+                    f'at iteration {i}: cyl={obstacle_counts[0]}, '
+                    f'balls={obstacle_counts[1]}, vox={obstacle_counts[2]}'
+                )
         env.reset()
 
         record_visualization = (i + 1) % args.plot_interval == 0
