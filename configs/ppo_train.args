@@ -2,18 +2,26 @@
 # PPO baseline：与主模型 (xnavdp_dense_corridor_v2) 相同环境分布的
 # 直接动作循环 PPO 训练配置。
 #
-# 环境块照抄 configs/xnavdp_dense_corridor_v2.args，保证基准对比时两者
-# 面对同一场景分布；PPO 超参与奖励权重独立于主模型，可单独调整。
+# 环境块、障碍密度课程与时域随机化均与
+# configs/xnavdp_dense_corridor_v2.args 对齐（2026-09-01 同步），保证
+# 论文对比时两者面对同一场景分布，唯一差异是算法本身
+# （PPO 直接输出 (v, omega)，无航路点 / 可微 MPC / 几何损失）。
+# PPO 超参与奖励权重独立于主模型，可单独调整。
 #
 # 用法：python3 train_ppo.py @configs/ppo_train.args
 # 命令行中出现在 @file 之后的参数会覆盖本文件中的取值。
 # =========================================================================
 
 # ---------------- 基础训练设置 ----------------
---batch_size 256              # 并行 CUDA 环境数
---rollout_steps 150           # 每次 PPO 更新的 rollout 步数（主模型时域 135~165）
---total_timesteps 20000000    # 总环境步数预算
---save_every 50               # checkpoint 间隔（PPO 更新次数）
+--batch_size 512              # 并行 CUDA 环境数（主模型同为 256）
+--rollout_steps 150           # 名义 rollout 步长（仅用于估算更新次数；
+#   开启时域随机化后实际步数在 [min_timesteps, max_timesteps] 内采样）
+--randomize_horizon true      # 与主模型一致：逐 rollout 随机采样步长，
+#   防止 GRU 把步数当作进度/减速线索
+--min_timesteps 135           # 主模型取值
+--max_timesteps 165           # 主模型取值
+--total_timesteps 60000000    # 总环境步数预算
+--save_every 100               # checkpoint 间隔（PPO 更新次数）
 --lr 0.0003
 --gamma 0.99
 --gae_lambda 0.95
@@ -26,7 +34,7 @@
 --target_kl 0.03
 --initial_log_std -0.7
 --anneal_lr true              # 随剩余步数线性衰减学习率
---seed 0
+--seed 1                      # 与主模型 seed 对齐
 
 # ---------------- checkpoint / 日志 ----------------
 --save_dir save/ppo_baseline
@@ -35,8 +43,11 @@
 # ---------------- 速度 / 目标 ----------------
 --max_speed 2.0               # 与主模型一致
 --max_omega 3.0
---cruise_v 1.5                # 策略初始速度偏置（对应主模型 initial_desired_speed）
+--cruise_v 1.6                # 策略初始速度偏置（= 主模型 initial_desired_speed）
 --goal_stop_distance 0.5      # 进入该半径即判定到达并结束回合
+#   （= 主模型 success_radius 0.50）
+--goal_state_max_distance 10.0 # 状态向量目标坐标的钳制/归一化半径
+#   （= 主模型 --goal_state_max_distance，必须一致）
 --safety_margin 0.25          # 间隙惩罚的安全裕量（机体表面到障碍表面）
 
 # ---------------- 执行器随机化（与主模型训练配置一致） ----------------
@@ -53,7 +64,7 @@
 # ---------------- 观测 ----------------
 --depth_noise_std 0.02        # 深度逆映射加性噪声（主模型固定 0.02）
 --fov_x_half_tan 0.82
---grad_decay 0.6
+--grad_decay 1.0              # 与主模型一致（原 0.6）
 --env_width 64
 --env_height 48
 
@@ -66,20 +77,40 @@
 --reward_smooth 0.05          # 指令平滑惩罚（归一化增量平方和）
 --reward_omega 0.01           # 角速度使用惩罚
 
-# ---------------- 环境设置（照抄 xnavdp_dense_corridor_v2.args） ----------------
+# ---------------- 环境设置（对齐 xnavdp_dense_corridor_v2.args） ----------------
 --map_size 14.0
---num_cyl 18
---num_balls 10
---num_vox 8
+--num_cyl 27                  # 课程关闭时的最高保留密度（主模型取值）
+--num_balls 15
+--num_vox 10
 --robot_radius 0.24
 --cyl_radius_min 0.15
 --cyl_radius_max 0.45
+--cyl_height_min 0.5          # 圆柱从地面起的最小高度 (m)
+--cyl_height_max 1.5          # 圆柱从地面起的最大高度 (m)
 --ball_radius_min 0.15
 --ball_radius_max 0.45
 --ball_radius_floor 0.25
 --initial_yaw_noise 0.26      # Env 默认值（主模型训练未显式传入）
 --randomize_start_goal true   # 四个角随机起点，终点取对角点
 --protected_zone_radius 1.0
+
+# ---------------- 障碍密度课程（对齐主模型，单位：PPO 更新次数） ----------------
+# 主模型在 15000 次迭代上以 20% / 60% 处切换混合相
+# (3000/9000)；本预算下总更新数 = ceil(2e7 / (256*150)) = 521，
+# 按相同比例换算：20% -> 104，60% -> 313。
+# 密度档位与混合概率与主模型完全一致：
+# phase 1 (0~104)：100% 低密度 20/11/8
+# phase 2 (104~313)：70% 低 + 30% 中
+# phase 3 (313~521)：50% 低 + 40% 中 + 10% 高
+--obstacle_curriculum true
+--obstacle_curriculum_mode mixed
+--obstacle_curriculum_boundaries 104 208 313   # staged 模式用（本配置为 mixed）
+--obstacle_curriculum_num_cyl 20 24 27 27
+--obstacle_curriculum_num_balls 11 13 15 15
+--obstacle_curriculum_num_vox 8 9 10 10
+--obstacle_curriculum_mix_boundaries 104 313
+--obstacle_curriculum_phase2_probs 0.70 0.30 0.00
+--obstacle_curriculum_phase3_probs 0.50 0.40 0.10
 
 # ---------------- 障碍布局 ----------------
 --obstacle_layout stratified

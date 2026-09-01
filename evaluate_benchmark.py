@@ -175,6 +175,7 @@ _SAVED_DEFAULTS = {
     'wheel_bias_std': 0.0,
     'max_speed': 2.0,
     'max_omega': 3.0,
+    'goal_state_max_distance': 6.0,
     'num_waypoints': 3,
     'hidden_dim': 192,
     'max_forward_step': 1.5,
@@ -331,7 +332,7 @@ def build_env(cfg, batch_size, benchmark, device):
     )
 
 
-def make_state(env, yaw_obs, v_obs):
+def make_state(cfg, env, yaw_obs, v_obs):
     """Goal state in the robot frame, exactly as in train_mpc.py."""
     vec_global = env.p_target[:, :2] - env.p[:, :2]
     cos_th = torch.cos(yaw_obs)
@@ -339,18 +340,19 @@ def make_state(env, yaw_obs, v_obs):
     local_x = vec_global[:, 0] * cos_th + vec_global[:, 1] * sin_th
     local_y = vec_global[:, 0] * -sin_th + vec_global[:, 1] * cos_th
     dist_target = torch.sqrt(local_x ** 2 + local_y ** 2)
+    max_distance = cfg.goal_state_max_distance
     scale = torch.where(
-        dist_target > 6.0,
-        6.0 / (dist_target + 1e-6),
+        dist_target > max_distance,
+        max_distance / (dist_target + 1e-6),
         torch.ones_like(dist_target),
     )
     return torch.stack([
-        local_x * scale / 6.0,
-        local_y * scale / 6.0,
+        local_x * scale / max_distance,
+        local_y * scale / max_distance,
         cos_th,
         sin_th,
-        dist_target * scale / 6.0,
-        v_obs,
+        dist_target * scale / max_distance,
+        v_obs / cfg.max_speed,
     ], dim=1)
 
 
@@ -471,7 +473,7 @@ def rollout_batch(cfg, model, mpc, benchmark, batch_size, seed):
             depth_inv = depth_inv + (
                 torch.randn_like(depth_inv) * cfg.depth_noise_std)
         depth_input = F.max_pool2d(depth_inv, 2, 2)
-        state = make_state(env, yaw_obs, v_obs)
+        state = make_state(cfg, env, yaw_obs, v_obs)
 
         distance_to_goal = torch.linalg.vector_norm(
             env.p_target[:, :2] - env.p[:, :2], dim=1)

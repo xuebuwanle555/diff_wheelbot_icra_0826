@@ -30,6 +30,10 @@ from tqdm import tqdm
 
 from env_cuda import Env
 from ppo_model import PPOActorCritic
+from train_mpc import (
+    obstacle_curriculum_probabilities,
+    obstacle_curriculum_state,
+)
 
 
 def str2bool(value):
@@ -65,6 +69,12 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=256,
                         help='Number of parallel CUDA environments')
     parser.add_argument('--rollout_steps', type=int, default=150)
+    parser.add_argument('--randomize_horizon', type=str2bool, default=True,
+                        help='Sample the rollout horizon per update, matching '
+                             'train_mpc.py so the recurrent policy cannot '
+                             'use the step count as a progress cue')
+    parser.add_argument('--min_timesteps', type=int, default=135)
+    parser.add_argument('--max_timesteps', type=int, default=165)
     parser.add_argument('--total_timesteps', type=int, default=20_000_000)
     parser.add_argument('--save_every', type=int, default=50,
                         help='Checkpoint interval in PPO updates')
@@ -108,6 +118,9 @@ def parse_args():
                         help='Initial policy speed bias; must be in '
                              '(0, max_speed)')
     parser.add_argument('--goal_stop_distance', type=float, default=0.5)
+    parser.add_argument('--goal_state_max_distance', type=float, default=6.0,
+                        help='Clamp/scale radius for goal coordinates in the '
+                             'state vector; must equal the main model value')
     # Clearance is robot-surface to obstacle-surface distance.
     parser.add_argument('--safety_margin', type=float, default=0.25)
 
@@ -128,6 +141,8 @@ def parse_args():
     parser.add_argument('--robot_radius', type=float, default=0.24)
     parser.add_argument('--cyl_radius_min', type=float, default=0.15)
     parser.add_argument('--cyl_radius_max', type=float, default=0.45)
+    parser.add_argument('--cyl_height_min', type=float, default=0.5)
+    parser.add_argument('--cyl_height_max', type=float, default=1.5)
     parser.add_argument('--ball_radius_min', type=float, default=0.15)
     parser.add_argument('--ball_radius_max', type=float, default=0.45)
     parser.add_argument('--ball_radius_floor', type=float, default=0.25)
@@ -144,6 +159,27 @@ def parse_args():
     parser.add_argument('--dynamic_obstacle_ratio', type=float, default=0.0)
     parser.add_argument('--dynamic_obstacle_speed_min', type=float, default=0.0)
     parser.add_argument('--dynamic_obstacle_speed_max', type=float, default=0.0)
+
+    # Obstacle-density curriculum, mirroring train_mpc.py.  Boundaries are
+    # expressed in PPO updates (train_mpc uses iterations); pick them at the
+    # same fractions of the total update budget.
+    parser.add_argument('--obstacle_curriculum', type=str2bool, default=False)
+    parser.add_argument('--obstacle_curriculum_mode',
+                        choices=('staged', 'mixed'), default='mixed')
+    parser.add_argument('--obstacle_curriculum_boundaries', type=int, nargs=3,
+                        default=[3000, 6000, 9000])
+    parser.add_argument('--obstacle_curriculum_num_cyl', type=int, nargs=4,
+                        default=[20, 24, 27, 27])
+    parser.add_argument('--obstacle_curriculum_num_balls', type=int, nargs=4,
+                        default=[11, 13, 15, 15])
+    parser.add_argument('--obstacle_curriculum_num_vox', type=int, nargs=4,
+                        default=[8, 9, 10, 10])
+    parser.add_argument('--obstacle_curriculum_mix_boundaries', type=int,
+                        nargs=2, default=[3000, 9000])
+    parser.add_argument('--obstacle_curriculum_phase2_probs', type=float,
+                        nargs=3, default=[0.70, 0.30, 0.00])
+    parser.add_argument('--obstacle_curriculum_phase3_probs', type=float,
+                        nargs=3, default=[0.50, 0.40, 0.10])
 
     args = parser.parse_args()
     validate_args(parser, args)
@@ -203,6 +239,61 @@ def validate_args(parser, args):
         parser.error('--obstacle_grid_jitter must be in [0, 1]')
     if args.obstacle_candidate_multiplier < 1.0:
         parser.error('--obstacle_candidate_multiplier must be at least 1')
+    if not 0.0 < args.cyl_height_min <= args.cyl_height_max:
+        parser.error('Invalid cylinder height range')
+    if args.goal_state_max_distance <= 0.0:
+        parser.error('--goal_state_max_distance must be positive')
+    if args.randomize_horizon:
+        if args.min_timesteps <= 0 or args.max_timesteps < args.min_timesteps:
+            parser.error('--min_timesteps must be positive and '
+                         '<= --max_timesteps')
+    curriculum_counts = (
+        args.obstacle_curriculum_num_cyl,
+        args.obstacle_curriculum_num_balls,
+        args.obstacle_curriculum_num_vox,
+    )
+    if any(min(counts) < 0 for counts in curriculum_counts):
+        parser.error('obstacle curriculum counts must be non-negative')
+    if any(
+            later < earlier
+            for counts in curriculum_counts
+            for earlier, later in zip(counts, counts[1:])):
+        parser.error('obstacle curriculum counts must be non-decreasing')
+    boundaries = args.obstacle_curriculum_boundaries
+    if any(boundary <= 0 for boundary in boundaries) or any(
+            later <= earlier
+            for earlier, later in zip(boundaries, boundaries[1:])):
+        parser.error(
+            '--obstacle_curriculum_boundaries must be positive and strictly '
+            'increasing')
+    mix_boundaries = args.obstacle_curriculum_mix_boundaries
+    if (mix_boundaries[0] <= 0
+            or mix_boundaries[1] <= mix_boundaries[0]):
+        parser.error(
+            '--obstacle_curriculum_mix_boundaries must be positive and '
+            'strictly increasing')
+    if args.obstacle_curriculum:
+        total_updates = math.ceil(
+            args.total_timesteps / (args.batch_size * args.rollout_steps))
+        if (args.obstacle_curriculum_mode == 'staged'
+                and boundaries[-1] >= total_updates):
+            parser.error(
+                'the final obstacle curriculum stage must begin before the '
+                'total number of PPO updates')
+        if (args.obstacle_curriculum_mode == 'mixed'
+                and mix_boundaries[-1] >= total_updates):
+            parser.error(
+                'the final mixed curriculum phase must begin before the '
+                'total number of PPO updates')
+    for name, probabilities in (
+            ('--obstacle_curriculum_phase2_probs',
+             args.obstacle_curriculum_phase2_probs),
+            ('--obstacle_curriculum_phase3_probs',
+             args.obstacle_curriculum_phase3_probs)):
+        if any(probability < 0.0 for probability in probabilities):
+            parser.error(f'{name} values must be non-negative')
+        if abs(sum(probabilities) - 1.0) > 1e-6:
+            parser.error(f'{name} values must sum to 1')
 
 
 def plot_trajectory(
@@ -283,7 +374,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def make_state(env, yaw_obs, v_obs):
+def make_state(env, yaw_obs, v_obs, args):
     """Goal state in the robot frame, exactly as in train_mpc.py."""
     vec_global = env.p_target[:, :2] - env.p[:, :2]
     cos_th = torch.cos(yaw_obs)
@@ -291,18 +382,21 @@ def make_state(env, yaw_obs, v_obs):
     local_x = vec_global[:, 0] * cos_th + vec_global[:, 1] * sin_th
     local_y = vec_global[:, 0] * -sin_th + vec_global[:, 1] * cos_th
     dist_target = torch.sqrt(local_x ** 2 + local_y ** 2)
+    max_distance = args.goal_state_max_distance
     scale = torch.where(
-        dist_target > 6.0,
-        6.0 / (dist_target + 1e-6),
+        dist_target > max_distance,
+        max_distance / (dist_target + 1e-6),
         torch.ones_like(dist_target),
     )
+    # Speed is normalised by the configured cap so the state is
+    # invariant to max_speed, identical to train_mpc.py.
     return torch.stack([
-        local_x * scale / 6.0,
-        local_y * scale / 6.0,
+        local_x * scale / max_distance,
+        local_y * scale / max_distance,
         cos_th,
         sin_th,
-        dist_target * scale / 6.0,
-        v_obs,
+        dist_target * scale / max_distance,
+        v_obs / args.max_speed,
     ], dim=1)
 
 
@@ -319,6 +413,8 @@ def build_env(args, device):
         robot_radius=args.robot_radius,
         cyl_radius_min=args.cyl_radius_min,
         cyl_radius_max=args.cyl_radius_max,
+        cyl_height_min=args.cyl_height_min,
+        cyl_height_max=args.cyl_height_max,
         ball_radius_min=args.ball_radius_min,
         ball_radius_max=args.ball_radius_max,
         ball_radius_floor=args.ball_radius_floor,
@@ -337,7 +433,7 @@ def build_env(args, device):
 
 
 @torch.no_grad()
-def collect_rollout(args, env, model, cpu_rng):
+def collect_rollout(args, env, model, cpu_rng, rollout_steps):
     device = env.p.device
     batch_size = args.batch_size
     env.reset()
@@ -385,7 +481,7 @@ def collect_rollout(args, env, model, cpu_rng):
         args.min_ctl_dt,
         cpu_rng.normal(
             1.0 / args.control_hz, args.dt_noise_std,
-            size=args.rollout_steps,
+            size=rollout_steps,
         ),
     ).tolist()
 
@@ -419,7 +515,7 @@ def collect_rollout(args, env, model, cpu_rng):
                 torch.randn_like(depth_inv) * args.depth_noise_std)
         depth_input = F.max_pool2d(depth_inv, 2, 2)
 
-        state = make_state(env, yaw_obs, v_obs)
+        state = make_state(env, yaw_obs, v_obs, args)
 
         command, latent, log_prob, value, hidden = model.sample_action(
             depth_input, state, hidden)
@@ -776,15 +872,50 @@ def main():
 
     start_time = time.perf_counter()
     progress = tqdm(range(start_update, total_updates), ncols=120)
+    active_curriculum_phase = None
+    active_obstacle_counts = None
     for update_index in progress:
         update = update_index + 1
         if args.anneal_lr:
             fraction = 1.0 - update_index / total_updates
             optimizer.param_groups[0]['lr'] = args.lr * fraction
 
-        rollout, rollout_metrics = collect_rollout(args, env, model, cpu_rng)
+        curriculum_phase, density_level, obstacle_counts = \
+            obstacle_curriculum_state(args, update_index)
+        if obstacle_counts != active_obstacle_counts:
+            env.set_obstacle_counts(*obstacle_counts)
+            active_obstacle_counts = obstacle_counts
+        if curriculum_phase != active_curriculum_phase:
+            active_curriculum_phase = curriculum_phase
+            if (args.obstacle_curriculum
+                    and args.obstacle_curriculum_mode == 'mixed'):
+                probabilities = obstacle_curriculum_probabilities(
+                    args, curriculum_phase)
+                tqdm.write(
+                    'Obstacle curriculum mixed phase '
+                    f'{curriculum_phase + 1}/3 at update {update_index}: '
+                    f'low/mid/high={probabilities}, '
+                    f'first_density_level={density_level + 1}, '
+                    f'counts={obstacle_counts}'
+                )
+            elif args.obstacle_curriculum:
+                tqdm.write(
+                    'Obstacle curriculum stage '
+                    f'{curriculum_phase + 1}/4 at update {update_index}: '
+                    f'cyl={obstacle_counts[0]}, balls={obstacle_counts[1]}, '
+                    f'vox={obstacle_counts[2]}'
+                )
+
+        if args.randomize_horizon:
+            rollout_steps = int(cpu_rng.integers(
+                args.min_timesteps, args.max_timesteps + 1))
+        else:
+            rollout_steps = args.rollout_steps
+
+        rollout, rollout_metrics = collect_rollout(
+            args, env, model, cpu_rng, rollout_steps)
         update_metrics = ppo_update(args, model, optimizer, rollout)
-        global_step += transitions_per_update
+        global_step += args.batch_size * rollout_steps
         elapsed = max(time.perf_counter() - start_time, 1e-6)
         steps_per_second = (
             global_step - start_update * transitions_per_update) / elapsed
