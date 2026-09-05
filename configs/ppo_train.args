@@ -3,7 +3,7 @@
 # 直接动作循环 PPO 训练配置。
 #
 # 环境块、障碍密度课程与时域随机化均与
-# configs/xnavdp_dense_corridor_v2.args 对齐（2026-09-01 同步），保证
+# configs/xnavdp_dense_corridor_gate_retention_v1.args 对齐，保证
 # 论文对比时两者面对同一场景分布，唯一差异是算法本身
 # （PPO 直接输出 (v, omega)，无航路点 / 可微 MPC / 几何损失）。
 # PPO 超参与奖励权重独立于主模型，可单独调整。
@@ -13,15 +13,15 @@
 # =========================================================================
 
 # ---------------- 基础训练设置 ----------------
---batch_size 512              # 并行 CUDA 环境数（主模型同为 256）
+--batch_size 256              # 与主模型相同的并行 CUDA 环境数
 --rollout_steps 150           # 名义 rollout 步长（仅用于估算更新次数；
 #   开启时域随机化后实际步数在 [min_timesteps, max_timesteps] 内采样）
 --randomize_horizon true      # 与主模型一致：逐 rollout 随机采样步长，
 #   防止 GRU 把步数当作进度/减速线索
 --min_timesteps 135           # 主模型取值
 --max_timesteps 165           # 主模型取值
---total_timesteps 60000000    # 总环境步数预算
---save_every 100               # checkpoint 间隔（PPO 更新次数）
+--total_timesteps 576000000   # 15000*256*E[T=150]，与主模型采样预算一致
+--save_every 3000             # 与主模型 checkpoint 阶段一致
 --lr 0.0003
 --gamma 0.99
 --gae_lambda 0.95
@@ -34,6 +34,7 @@
 --target_kl 0.03
 --initial_log_std -0.7
 --anneal_lr true              # 随剩余步数线性衰减学习率
+--hidden_dim 192              # 与主模型 CNN/GRU 隐状态容量一致
 --seed 1                      # 与主模型 seed 对齐
 
 # ---------------- checkpoint / 日志 ----------------
@@ -64,7 +65,7 @@
 # ---------------- 观测 ----------------
 --depth_noise_std 0.02        # 深度逆映射加性噪声（主模型固定 0.02）
 --fov_x_half_tan 0.82
---grad_decay 1.0              # 与主模型一致（原 0.6）
+--grad_decay 0.8              # 与 gate_retention_v1 checkpoint 一致
 --env_width 64
 --env_height 48
 
@@ -96,19 +97,19 @@
 
 # ---------------- 障碍密度课程（对齐主模型，单位：PPO 更新次数） ----------------
 # 主模型在 15000 次迭代上以 20% / 60% 处切换混合相
-# (3000/9000)；本预算下总更新数 = ceil(2e7 / (256*150)) = 521，
-# 按相同比例换算：20% -> 104，60% -> 313。
+# (3000/9000)；本预算下名义总更新数
+# = ceil(5.76e8 / (256*150)) = 15000，因此直接使用相同切换点。
 # 密度档位与混合概率与主模型完全一致：
-# phase 1 (0~104)：100% 低密度 20/11/8
-# phase 2 (104~313)：70% 低 + 30% 中
-# phase 3 (313~521)：50% 低 + 40% 中 + 10% 高
+# phase 1 (0~3000)：100% 低密度 20/11/8
+# phase 2 (3000~9000)：70% 低 + 30% 中
+# phase 3 (9000~15000)：50% 低 + 40% 中 + 10% 高
 --obstacle_curriculum true
 --obstacle_curriculum_mode mixed
---obstacle_curriculum_boundaries 104 208 313   # staged 模式用（本配置为 mixed）
+--obstacle_curriculum_boundaries 3000 6000 9000   # staged 模式用（本配置为 mixed）
 --obstacle_curriculum_num_cyl 20 24 27 27
 --obstacle_curriculum_num_balls 11 13 15 15
 --obstacle_curriculum_num_vox 8 9 10 10
---obstacle_curriculum_mix_boundaries 104 313
+--obstacle_curriculum_mix_boundaries 3000 9000
 --obstacle_curriculum_phase2_probs 0.70 0.30 0.00
 --obstacle_curriculum_phase3_probs 0.50 0.40 0.10
 

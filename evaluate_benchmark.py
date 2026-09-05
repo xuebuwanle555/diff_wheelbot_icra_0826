@@ -141,12 +141,12 @@ def set_seed(seed):
 _SAVED_DEFAULTS = {
     'env_width': 64,
     'env_height': 48,
-    'grad_decay': 0.6,
+    'grad_decay': 0.8,
     'fov_x_half_tan': 0.82,
     'map_size': 14.0,
-    'num_cyl': 18,
-    'num_balls': 10,
-    'num_vox': 8,
+    'num_cyl': 27,
+    'num_balls': 15,
+    'num_vox': 10,
     'robot_radius': 0.24,
     'cyl_radius_min': 0.15,
     'cyl_radius_max': 0.45,
@@ -175,14 +175,14 @@ _SAVED_DEFAULTS = {
     'wheel_bias_std': 0.0,
     'max_speed': 2.0,
     'max_omega': 3.0,
-    'goal_state_max_distance': 6.0,
+    'goal_state_max_distance': 10.0,
     'num_waypoints': 3,
     'hidden_dim': 192,
     'max_forward_step': 1.5,
     'max_lateral_step': 1.0,
     'initial_desired_speed': 1.5,
     'min_desired_speed': 0.1,
-    'cruise_v': 1.5,
+    'cruise_v': 1.6,
     'mpc_horizon': 12,
     'mpc_control_lookahead': 3,
     'mpc_max_acc_v': 8.0,
@@ -230,7 +230,8 @@ def load_checkpoint(args, device):
     checkpoint = torch.load(args.checkpoint, map_location=device)
     if not isinstance(checkpoint, dict):
         raise ValueError(f'Unsupported checkpoint format: {args.checkpoint}')
-    is_ppo_checkpoint = checkpoint.get('format') == 'icra_ppo_v1'
+    is_ppo_checkpoint = checkpoint.get('format') in {
+        'icra_ppo_v1', 'icra_ppo_v2'}
     if args.policy_type == 'ppo' and not is_ppo_checkpoint:
         raise ValueError(
             f'{args.checkpoint} is not a PPO checkpoint '

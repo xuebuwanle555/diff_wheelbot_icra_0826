@@ -92,6 +92,8 @@ def parse_args():
     parser.add_argument('--target_kl', type=float, default=0.03)
     parser.add_argument('--initial_log_std', type=float, default=-0.7)
     parser.add_argument('--anneal_lr', type=str2bool, default=True)
+    parser.add_argument('--hidden_dim', type=int, default=192,
+                        help='Shared CNN/GRU capacity; 192 matches main model')
 
     # Actuation randomization, matching train_mpc.py argument names.
     parser.add_argument('--control_hz', type=float, default=15.0)
@@ -189,6 +191,7 @@ def parse_args():
 def validate_args(parser, args):
     positive = (
         'batch_size', 'rollout_steps', 'total_timesteps', 'save_every',
+        'hidden_dim',
         'lr', 'gamma', 'gae_lambda', 'clip_coef', 'max_grad_norm',
         'update_epochs', 'minibatch_envs', 'control_hz', 'min_ctl_dt',
         'max_speed', 'max_omega', 'motor_rate_min', 'motor_rate_max',
@@ -608,6 +611,26 @@ def collect_rollout(args, env, model, cpu_rng, rollout_steps):
         'done': torch.stack(dones),
         'valid': torch.stack(valid_steps),
     }
+    # A rollout horizon is a time-limit truncation, not an MDP terminal.  For
+    # environments that are still active, bootstrap V(s_T) from the final
+    # observation.  Treating it as zero teaches an artificial end-of-horizon
+    # value drop and can make a recurrent policy slow down near T.
+    if bool(active.any()):
+        yaw_obs = env.theta[:, 2]
+        v_obs = env.v[:, 0]
+        depth, _ = env.render(ctl_dts[-1])
+        depth_inv = 3.0 / depth.clamp(min=0.2, max=10.0) - 0.6
+        if args.depth_noise_std > 0.0:
+            depth_inv = depth_inv + (
+                torch.randn_like(depth_inv) * args.depth_noise_std)
+        final_depth = F.max_pool2d(depth_inv, 2, 2)
+        final_state = make_state(env, yaw_obs, v_obs, args)
+        _, bootstrap_value, _ = model(final_depth, final_state, hidden)
+        bootstrap_value = torch.where(
+            active, bootstrap_value, torch.zeros_like(bootstrap_value))
+    else:
+        bootstrap_value = torch.zeros(batch_size, device=device)
+    rollout['bootstrap_value'] = bootstrap_value
     rollout['advantage'], rollout['return'] = compute_gae(args, rollout)
     rollout['p_history'] = torch.stack(p_hist_list)  # (T+1, B, 3)
     rollout['min_clearance'] = min_clearance
@@ -616,7 +639,8 @@ def collect_rollout(args, env, model, cpu_rng, rollout_steps):
         'return': episode_return.mean().item(),
         'arrival_rate': arrived.float().mean().item(),
         'collision_rate': collided.float().mean().item(),
-        'strict_success_rate':
+        'success_rate': (arrived & ~collided).float().mean().item(),
+        'clearance_safe_arrival_rate':
             (arrived & ~clearance_violated).float().mean().item(),
         'clearance_violation_rate':
             clearance_violated.float().mean().item(),
@@ -648,7 +672,8 @@ def compute_gae(args, rollout):
     horizon = rewards.shape[0]
     advantages = torch.zeros_like(rewards)
     last_advantage = torch.zeros(rewards.shape[1], device=rewards.device)
-    last_value = torch.zeros_like(last_advantage)
+    last_value = rollout.get(
+        'bootstrap_value', torch.zeros_like(last_advantage))
 
     for step in reversed(range(horizon)):
         next_value = (
@@ -761,7 +786,8 @@ def ppo_update(args, model, optimizer, rollout):
 
 def checkpoint_payload(args, model, optimizer, update, global_step):
     return {
-        'format': 'icra_ppo_v1',
+        'format': 'icra_ppo_v2',
+        'time_limit_bootstrap': True,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'update': update,
@@ -825,8 +851,11 @@ def main():
     if args.resume:
         print(f'Loading checkpoint: {args.resume}')
         ckpt = torch.load(args.resume, map_location=device)
-        if ckpt.get('format') != 'icra_ppo_v1':
-            raise ValueError(f'Not a PPO baseline checkpoint: {args.resume}')
+        if ckpt.get('format') != 'icra_ppo_v2':
+            raise ValueError(
+                'Only corrected icra_ppo_v2 checkpoints can be resumed. '
+                'Legacy v1 checkpoints used zero-value time-limit truncation '
+                f'and must be retrained: {args.resume}')
         start_update = int(ckpt['update'])
         global_step = int(ckpt['global_step'])
 
@@ -839,7 +868,7 @@ def main():
     env = build_env(args, device)
     model = PPOActorCritic(
         dim_obs=6,
-        hidden_dim=192,
+        hidden_dim=args.hidden_dim,
         input_w=args.env_width // 2,
         input_h=args.env_height // 2,
         max_v=args.max_speed,
@@ -871,6 +900,7 @@ def main():
             f'requested training budget')
 
     start_time = time.perf_counter()
+    start_global_step = global_step
     progress = tqdm(range(start_update, total_updates), ncols=120)
     active_curriculum_phase = None
     active_obstacle_counts = None
@@ -918,7 +948,7 @@ def main():
         global_step += args.batch_size * rollout_steps
         elapsed = max(time.perf_counter() - start_time, 1e-6)
         steps_per_second = (
-            global_step - start_update * transitions_per_update) / elapsed
+            global_step - start_global_step) / elapsed
 
         for name, value in rollout_metrics.items():
             writer.add_scalar(f'Rollout/{name}', value, global_step)
@@ -939,7 +969,7 @@ def main():
             f"R:{rollout_metrics['return']:.1f}|"
             f"Arr:{rollout_metrics['arrival_rate']:.0%}|"
             f"Col:{rollout_metrics['collision_rate']:.0%}|"
-            f"Suc:{rollout_metrics['strict_success_rate']:.0%}|"
+            f"Suc:{rollout_metrics['success_rate']:.0%}|"
             f"D:{rollout_metrics['final_distance']:.1f}|"
             f"KL:{update_metrics['approx_kl']:.3f}"
         )

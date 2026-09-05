@@ -78,6 +78,9 @@ python3 train_mpc.py @configs/train_param.args
 # Override individual parameters on the command line
 python3 train_mpc.py @configs/train_param.args --batch_size 32
 
+# Train the recurrent direct-action PPO baseline on the matched distribution
+python3 train_ppo.py @configs/ppo_train.args --seed 1
+
 # Resume from the latest checkpoint
 python3 train_mpc.py @configs/train_param.args \
   --resume save/seed1_<timestamp>/latest.pth
@@ -142,6 +145,37 @@ Checkpoints are saved every `--ckpt_interval` iterations inside the unique run
 directory (`checkpoint_mpc_<iter>.pth` plus `latest.pth`, containing model,
 optimizer, scheduler, arguments and run metadata). TensorBoard logs include the
 total loss, per-term losses, and success/collision/final-distance metrics.
+
+The PPO baseline uses the same 64x48 metric-depth input, six-dimensional goal
+state, CNN/GRU encoder, 0.25 m camera height, Dingo proxy geometry, actuator
+randomization, start/goal sampling, random 135--165 step horizon, and obstacle
+curriculum as the current gate-retention main model. It differs at the output
+and optimization layers: PPO directly predicts `(v, omega)` and never uses
+waypoints or MPC. Corrected checkpoints have format `icra_ppo_v2`; older
+`icra_ppo_v1` checkpoints used zero-value time-limit truncation and should not
+be reported as the final baseline. The default PPO budget is 576 million
+sampled environment steps (15000 nominal updates), matching the main model's
+batch/horizon budget. Validate the configuration before training:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/icra0826_ppo_pycache \
+MPLCONFIGDIR=/tmp/icra0826_ppo_mpl \
+bash verify_ppo_alignment.sh
+```
+
+Evaluate a PPO checkpoint on the local CUDA benchmark or compare it against the
+main model with identical seeds and episodes:
+
+```bash
+python3 evaluate_benchmark.py \
+  --checkpoint save/ppo_baseline/seed1_<timestamp>/checkpoint_ppo_final.pth \
+  --policy_type ppo --benchmark all --episodes 256
+
+python3 compare_baselines.py \
+  --main save/xnavdp_dense_corridor_v2/gate_retention_v1/checkpoint_mpc_12000.pth \
+  --ppo save/ppo_baseline/seed1_<timestamp>/checkpoint_ppo_final.pth \
+  --benchmark all --episodes 256
+```
 
 Obstacle losses use differentiable signed clearance to the planar obstacle
 footprint. The avoidance barrier keeps a base weight of one and adds a bounded,
